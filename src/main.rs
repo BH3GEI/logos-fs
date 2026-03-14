@@ -16,6 +16,7 @@ pub mod pb {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    load_repo_env_file();
     let listen = resolve_listen_target();
     let users_root = resolve_users_root();
     let embedding = resolve_embedding_config();
@@ -44,7 +45,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn resolve_listen_target() -> String {
-    std::env::var("VFS_LISTEN").unwrap_or_else(|_| "unix:///tmp/kairos-runtime-vfs.sock".to_string())
+    std::env::var("VFS_LISTEN")
+        .or_else(|_| std::env::var("KAIROS_VFS_SOCKET"))
+        .unwrap_or_else(|_| "unix:///run/kairos-runtime/sockets/kairos-runtime-vfs.sock".to_string())
 }
 
 fn parse_uds_path(listen: &str) -> Option<PathBuf> {
@@ -94,4 +97,9 @@ fn resolve_embedding_config() -> EmbeddingConfig {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(1024),
     }
+}
+
+fn load_repo_env_file() {
+    let env_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").join(".env");
+    let _ = dotenvy::from_path(env_path);
 }
