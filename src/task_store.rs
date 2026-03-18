@@ -262,6 +262,15 @@ impl TaskStore {
             if changed == 0 {
                 return Err(VfsError::NotFound(format!("task not found: {task_id}")));
             }
+            // Rebuild FTS entry for updated description
+            conn.execute(
+                "DELETE FROM tasks_fts WHERE rowid = (SELECT rowid FROM tasks WHERE task_id = ?1)",
+                rusqlite::params![task_id],
+            ).ok();
+            conn.execute(
+                "INSERT INTO tasks_fts(rowid, description) SELECT rowid, description FROM tasks WHERE task_id = ?1",
+                rusqlite::params![task_id],
+            ).ok();
             Ok(())
         })
         .await
