@@ -74,6 +74,11 @@ impl TaskStore {
                 rusqlite::params![task_id, description, workspace, resource, chat_id, trigger, now],
             )
             .map_err(|e| VfsError::Sqlite(format!("insert task failed: {e}")))?;
+            conn.execute(
+                "INSERT INTO tasks_fts(rowid, description) SELECT rowid, description FROM tasks WHERE task_id = ?1",
+                rusqlite::params![task_id],
+            )
+            .map_err(|e| VfsError::Sqlite(format!("sync task FTS failed: {e}")))?;
             Ok(())
         })
         .await
@@ -196,6 +201,44 @@ impl TaskStore {
         .map_err(|e| VfsError::Io(format!("spawn_blocking join failed: {e}")))?
     }
 
+    // RFC 003 Section 6.2 L2: text search on task description
+    pub async fn search_tasks_fts(
+        &self,
+        query: &str,
+        limit: i32,
+    ) -> Result<Vec<Task>, VfsError> {
+        if query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = Arc::clone(&self.conn);
+        let query = query.to_string();
+        let limit = limit.max(1).min(50);
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn
+                .lock()
+                .map_err(|e| VfsError::Sqlite(format!("lock failed: {e}")))?;
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT t.task_id, t.description, t.workspace, t.resource, t.status,
+                            t.chat_id, t.trigger, t.created_at, t.updated_at
+                     FROM tasks_fts fts
+                     JOIN tasks t ON fts.rowid = t.rowid
+                     WHERE tasks_fts MATCH ?1
+                     ORDER BY rank
+                     LIMIT ?2",
+                )
+                .map_err(|e| VfsError::Sqlite(format!("prepare FTS query failed: {e}")))?;
+            let rows = stmt
+                .query_map(rusqlite::params![query, limit], row_to_task)
+                .map_err(|e| VfsError::Sqlite(format!("FTS query failed: {e}")))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| VfsError::Sqlite(format!("read rows failed: {e}")))
+        })
+        .await
+        .map_err(|e| VfsError::Io(format!("spawn_blocking join failed: {e}")))?
+    }
+
     pub async fn update_description(
         &self,
         task_id: &str,
@@ -242,7 +285,11 @@ fn init_task_schema(conn: &Connection) -> Result<(), VfsError> {
            updated_at   TEXT NOT NULL
          );
          CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
-         CREATE INDEX IF NOT EXISTS idx_tasks_chat ON tasks(chat_id);",
+         CREATE INDEX IF NOT EXISTS idx_tasks_chat ON tasks(chat_id);
+
+         CREATE VIRTUAL TABLE IF NOT EXISTS tasks_fts USING fts5(
+           description, content=tasks, content_rowid=rowid
+         );",
     )
     .map_err(|e| VfsError::Sqlite(format!("init task schema failed: {e}")))
 }
@@ -368,6 +415,38 @@ mod tests {
 
         let err = store.update_description("no-such", "desc").await;
         assert!(err.is_err());
+    }
+
+    #[tokio::test]
+    async fn search_tasks_fts_works() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = make_test_store(tmp.path());
+
+        store
+            .create_task(&NewTask {
+                description: "Deploy TTS service for voice synthesis".to_string(),
+                ..sample_task("t1")
+            })
+            .await
+            .unwrap();
+        store
+            .create_task(&NewTask {
+                description: "Fix database migration for PostgreSQL".to_string(),
+                ..sample_task("t2")
+            })
+            .await
+            .unwrap();
+
+        let results = store.search_tasks_fts("TTS voice", 10).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].task_id, "t1");
+
+        let results = store.search_tasks_fts("PostgreSQL", 10).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].task_id, "t2");
+
+        let empty = store.search_tasks_fts("", 10).await.unwrap();
+        assert!(empty.is_empty());
     }
 
     #[tokio::test]

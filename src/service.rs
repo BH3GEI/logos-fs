@@ -776,22 +776,18 @@ impl MemoryVfs for MemoryVfsService {
         }
     }
 
+    // RFC 003 Section 6.2: multi-level experience retrieval
+    // L1: BM25 exact match on anchor facts (symptom_snippet)
+    // L2: FTS on task description/summary
     async fn search_tasks(
         &self,
         request: Request<SearchTasksRequest>,
     ) -> Result<Response<SearchTasksResponse>, Status> {
         let started_at = Instant::now();
         let req = request.into_inner();
-        let detail = format!("query={} chat_id={} status={}", req.query, req.chat_id, req.status);
+        let detail = format!("query={} limit={}", req.query, req.limit);
 
-        let tasks = if let Some(ref ts) = self.task_store {
-            let chat_id = if req.chat_id.is_empty() { None } else { Some(req.chat_id.as_str()) };
-            let status = if req.status.is_empty() { None } else { Some(req.status.as_str()) };
-            ts.list_tasks(chat_id, status).await?
-        } else {
-            Vec::new()
-        };
-
+        // L1: anchor facts BM25
         let anchors = if !req.query.is_empty() {
             if let Some(ref a) = self.anchor_store {
                 a.search_facts_bm25(&req.query, req.limit).await?
@@ -802,7 +798,22 @@ impl MemoryVfs for MemoryVfsService {
             Vec::new()
         };
 
-        log_ok("search_tasks", &format!("{detail} tasks={} anchors={}", tasks.len(), anchors.len()), started_at);
+        // L2: task metadata FTS
+        let tasks = if !req.query.is_empty() {
+            if let Some(ref ts) = self.task_store {
+                ts.search_tasks_fts(&req.query, req.limit).await?
+            } else {
+                Vec::new()
+            }
+        } else if let Some(ref ts) = self.task_store {
+            let chat_id = if req.chat_id.is_empty() { None } else { Some(req.chat_id.as_str()) };
+            let status = if req.status.is_empty() { None } else { Some(req.status.as_str()) };
+            ts.list_tasks(chat_id, status).await?
+        } else {
+            Vec::new()
+        };
+
+        log_ok("search_tasks", &format!("{detail} L1_anchors={} L2_tasks={}", anchors.len(), tasks.len()), started_at);
         Ok(Response::new(SearchTasksResponse {
             tasks: tasks.into_iter().map(task_to_proto).collect(),
             anchors: anchors.into_iter().map(anchor_fact_to_proto).collect(),
