@@ -237,3 +237,119 @@ async fn atomic_write_json(target: &Path, value: &Value) -> Result<(), VfsError>
 fn valid_user_file_names() -> [&'static str; 3] {
     ["preferences.json", "tech_projects.json", "relations.json"]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_store(dir: &Path) -> UsersStore {
+        UsersStore::new(dir.to_path_buf()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn read_write_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = make_store(tmp.path());
+
+        store
+            .write(
+                "mem://users/alice/preferences.json",
+                r#"{"theme": "dark"}"#,
+            )
+            .await
+            .unwrap();
+
+        let content = store.read("mem://users/alice/preferences.json").await.unwrap();
+        let value: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(value["theme"], "dark");
+    }
+
+    #[tokio::test]
+    async fn patch_merges_deeply() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = make_store(tmp.path());
+
+        store
+            .write(
+                "mem://users/bob/preferences.json",
+                r#"{"ui": {"font": "mono", "size": 14}, "lang": "en"}"#,
+            )
+            .await
+            .unwrap();
+
+        store
+            .patch(
+                "mem://users/bob/preferences.json",
+                r#"{"ui": {"size": 16}, "color": "blue"}"#,
+            )
+            .await
+            .unwrap();
+
+        let content = store.read("mem://users/bob/preferences.json").await.unwrap();
+        let value: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(value["ui"]["font"], "mono");
+        assert_eq!(value["ui"]["size"], 16);
+        assert_eq!(value["lang"], "en");
+        assert_eq!(value["color"], "blue");
+    }
+
+    #[tokio::test]
+    async fn invalid_path_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = make_store(tmp.path());
+
+        assert!(store.read("invalid://path").await.is_err());
+        assert!(store.read("mem://users/alice/unknown.json").await.is_err());
+        assert!(store.read("mem://chats/123/preferences.json").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_nonexistent_initializes_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = make_store(tmp.path());
+
+        store
+            .write(
+                "mem://users/carol/preferences.json",
+                r#"{"x": 1}"#,
+            )
+            .await
+            .unwrap();
+
+        let content = store
+            .read("mem://users/carol/tech_projects.json")
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert!(value.as_object().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn concurrent_writes_dont_corrupt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(make_store(tmp.path()));
+
+        let mut handles = Vec::new();
+        for i in 0..10 {
+            let s = Arc::clone(&store);
+            handles.push(tokio::spawn(async move {
+                s.write(
+                    "mem://users/dave/preferences.json",
+                    &format!(r#"{{"iter": {i}}}"#),
+                )
+                .await
+                .unwrap();
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let content = store
+            .read("mem://users/dave/preferences.json")
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert!(value["iter"].is_number());
+    }
+}

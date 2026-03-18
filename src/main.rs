@@ -1,10 +1,13 @@
+mod message_store;
 mod service;
 mod sessions_store;
 mod users_store;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::{io, net::SocketAddr};
 
+use message_store::MessageStore;
 use service::{EmbeddingConfig, MemoryVfsService};
 use tokio::net::UnixListener;
 use tokio_stream::wrappers::UnixListenerStream;
@@ -20,7 +23,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listen = resolve_listen_target();
     let users_root = resolve_users_root();
     let embedding = resolve_embedding_config();
-    let service = MemoryVfsService::new(users_root.clone(), embedding)?;
+
+    let state_root = users_root
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let memory_db_root = state_root.join("memory");
+    let message_store = Arc::new(MessageStore::new(memory_db_root)?);
+
+    let service = MemoryVfsService::new(users_root.clone(), embedding, message_store)?;
     let grpc_service = pb::memory_vfs_server::MemoryVfsServer::new(service);
 
     if let Some(socket_path) = parse_uds_path(&listen) {
@@ -37,8 +48,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
     } else {
         let addr: SocketAddr = listen.parse()?;
-        println!("memory-vfs listening on {addr}, users root: {}", users_root.display());
-        Server::builder().add_service(grpc_service).serve(addr).await?;
+        println!(
+            "memory-vfs listening on {addr}, users root: {}",
+            users_root.display()
+        );
+        Server::builder()
+            .add_service(grpc_service)
+            .serve(addr)
+            .await?;
     }
 
     Ok(())
@@ -82,7 +99,6 @@ fn resolve_users_root() -> PathBuf {
     if let Ok(path) = std::env::var("VFS_USERS_ROOT") {
         return PathBuf::from(path);
     }
-
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/state/entities")
 }
 

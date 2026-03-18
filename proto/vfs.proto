@@ -8,16 +8,17 @@ service MemoryVFS {
   rpc Patch(PatchRequest) returns (PatchResponse);
   rpc Search(SearchRequest) returns (SearchResponse);
   rpc Archive(ArchiveRequest) returns (ArchiveResponse);
+  rpc RangeFetch(RangeFetchRequest) returns (RangeFetchResponse);
 }
+
+// --- Read/Write/Patch (users namespace) ---
 
 message ReadRequest {
   string path = 1;
 }
 
 message ReadResponse {
-  bool success = 1;
-  string content = 2;
-  string error_msg = 3;
+  string content = 1;
 }
 
 message WriteRequest {
@@ -25,20 +26,16 @@ message WriteRequest {
   string content = 2;
 }
 
-message WriteResponse {
-  bool success = 1;
-  string error_msg = 2;
-}
+message WriteResponse {}
 
 message PatchRequest {
   string path = 1;
   string partial_content = 2;
 }
 
-message PatchResponse {
-  bool success = 1;
-  string error_msg = 2;
-}
+message PatchResponse {}
+
+// --- Search ---
 
 message SearchRequest {
   string query = 1;
@@ -51,6 +48,7 @@ enum SearchMode {
   SEARCH_MODE_UNSPECIFIED = 0;
   SEARCH_MODE_SEMANTIC = 1;
   SEARCH_MODE_EXACT = 2;
+  SEARCH_MODE_FTS = 3;
 }
 
 message SearchResponse {
@@ -65,6 +63,8 @@ message SearchResult {
   float score = 5;
 }
 
+// --- Archive ---
+
 message ArchiveRequest {
   string session_id = 1;
   string chat_id = 2;
@@ -73,10 +73,39 @@ message ArchiveRequest {
   repeated ChatMessage messages = 5;
 }
 
-message ArchiveResponse {
-  bool success = 1;
-  string error_msg = 2;
+message ArchiveResponse {}
+
+// --- RangeFetch ---
+
+message RangeFetchRequest {
+  string chat_id = 1;
+  repeated MessageRange ranges = 2;
+  int32 limit = 3;
+  int32 offset = 4;
 }
+
+message MessageRange {
+  int64 start = 1;
+  int64 end = 2;
+}
+
+message RangeFetchResponse {
+  repeated StoredMessage messages = 1;
+}
+
+message StoredMessage {
+  int64 msg_id = 1;
+  string external_id = 2;
+  string ts = 3;
+  string chat_id = 4;
+  string speaker = 5;
+  string reply_to = 6;
+  string text = 7;
+  repeated string mentions = 8;
+  string session_id = 9;
+}
+
+// --- Shared message types ---
 
 message ChatMessage {
   string user_id = 1;
