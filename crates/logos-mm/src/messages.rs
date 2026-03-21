@@ -214,7 +214,7 @@ async fn init_schema(pool: &SqlitePool) -> Result<(), VfsError> {
             ts        TEXT NOT NULL,
             chat_id   TEXT NOT NULL,
             speaker   TEXT NOT NULL,
-            reply_to  INTEGER REFERENCES messages(msg_id),
+            reply_to  INTEGER,
             text      TEXT NOT NULL,
             mentions  TEXT
         )",
