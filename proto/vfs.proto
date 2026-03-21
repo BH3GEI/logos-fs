@@ -8,26 +8,37 @@ service MemoryVFS {
   rpc Patch(PatchRequest) returns (PatchResponse);
   rpc Search(SearchRequest) returns (SearchResponse);
   rpc Archive(ArchiveRequest) returns (ArchiveResponse);
-  rpc RangeFetch(RangeFetchRequest) returns (RangeFetchResponse);
-  rpc WriteSummary(WriteSummaryRequest) returns (WriteSummaryResponse);
-  rpc ReadSummary(ReadSummaryRequest) returns (ReadSummaryResponse);
-  rpc ListSummaries(ListSummariesRequest) returns (ListSummariesResponse);
-  rpc ReadPersona(ReadPersonaRequest) returns (ReadPersonaResponse);
-  rpc WritePersona(WritePersonaRequest) returns (WritePersonaResponse);
-  rpc CreateAnchor(CreateAnchorRequest) returns (CreateAnchorResponse);
-  rpc SearchTasks(SearchTasksRequest) returns (SearchTasksResponse);
 }
 
-// --- Read/Write/Patch (generic URI) ---
+message ReadRequest {
+  string path = 1;
+}
 
-message ReadRequest { string path = 1; }
-message ReadResponse { string content = 1; }
-message WriteRequest { string path = 1; string content = 2; }
-message WriteResponse {}
-message PatchRequest { string path = 1; string partial_content = 2; }
-message PatchResponse {}
+message ReadResponse {
+  bool success = 1;
+  string content = 2;
+  string error_msg = 3;
+}
 
-// --- Search ---
+message WriteRequest {
+  string path = 1;
+  string content = 2;
+}
+
+message WriteResponse {
+  bool success = 1;
+  string error_msg = 2;
+}
+
+message PatchRequest {
+  string path = 1;
+  string partial_content = 2;
+}
+
+message PatchResponse {
+  bool success = 1;
+  string error_msg = 2;
+}
 
 message SearchRequest {
   string query = 1;
@@ -40,10 +51,11 @@ enum SearchMode {
   SEARCH_MODE_UNSPECIFIED = 0;
   SEARCH_MODE_SEMANTIC = 1;
   SEARCH_MODE_EXACT = 2;
-  SEARCH_MODE_FTS = 3;
 }
 
-message SearchResponse { repeated SearchResult results = 1; }
+message SearchResponse {
+  repeated SearchResult results = 1;
+}
 
 message SearchResult {
   string session_id = 1;
@@ -53,8 +65,6 @@ message SearchResult {
   float score = 5;
 }
 
-// --- Archive ---
-
 message ArchiveRequest {
   string session_id = 1;
   string chat_id = 2;
@@ -63,147 +73,10 @@ message ArchiveRequest {
   repeated ChatMessage messages = 5;
 }
 
-message ArchiveResponse {}
-
-// --- RangeFetch ---
-
-message RangeFetchRequest {
-  string chat_id = 1;
-  repeated MessageRange ranges = 2;
-  int32 limit = 3;
-  int32 offset = 4;
+message ArchiveResponse {
+  bool success = 1;
+  string error_msg = 2;
 }
-
-message MessageRange { int64 start = 1; int64 end = 2; }
-message RangeFetchResponse { repeated StoredMessage messages = 1; }
-
-message StoredMessage {
-  int64 msg_id = 1;
-  string external_id = 2;
-  string ts = 3;
-  string chat_id = 4;
-  string speaker = 5;
-  int64 reply_to = 6;
-  string text = 7;
-  repeated string mentions = 8;
-  string session_id = 9;
-}
-
-// --- Summary Tree ---
-
-message WriteSummaryRequest {
-  string chat_id = 1;
-  string layer = 2;
-  string period_start = 3;
-  string period_end = 4;
-  string source_refs = 5;
-  string content = 6;
-}
-
-message WriteSummaryResponse { int64 id = 1; }
-
-message ReadSummaryRequest {
-  string chat_id = 1;
-  string layer = 2;
-  string period_start = 3;
-}
-
-message ReadSummaryResponse { SummaryRecord summary = 1; }
-
-message ListSummariesRequest {
-  string chat_id = 1;
-  string layer = 2;
-  string start = 3;
-  string end = 4;
-  int32 limit = 5;
-}
-
-message ListSummariesResponse { repeated SummaryRecord summaries = 1; }
-
-message SummaryRecord {
-  int64 id = 1;
-  string chat_id = 2;
-  string layer = 3;
-  string period_start = 4;
-  string period_end = 5;
-  string source_refs = 6;
-  string content = 7;
-  string generated_at = 8;
-}
-
-// --- Persona ---
-
-message ReadPersonaRequest {
-  string user_id = 1;
-  string layer = 2;
-  string period = 3;
-}
-
-message ReadPersonaResponse { repeated PersonaEntry entries = 1; }
-
-message WritePersonaRequest {
-  string user_id = 1;
-  string layer = 2;
-  string period = 3;
-  string content = 4;
-}
-
-message WritePersonaResponse {}
-
-message PersonaEntry {
-  int64 id = 1;
-  string user_id = 2;
-  string layer = 3;
-  string period = 4;
-  string content = 5;
-  string created_at = 6;
-}
-
-// --- Anchors ---
-
-message CreateAnchorRequest {
-  string task_id = 1;
-  string summary = 2;
-  string facts = 3;
-}
-
-message CreateAnchorResponse { string anchor_id = 1; }
-
-message AnchorRecord {
-  string id = 1;
-  string task_id = 2;
-  string summary = 3;
-  string facts = 4;
-  string created_at = 5;
-}
-
-// --- Tasks ---
-
-message SearchTasksRequest {
-  string query = 1;
-  int32 limit = 2;
-  string chat_id = 3;
-  string status = 4;
-}
-
-message SearchTasksResponse {
-  repeated TaskRecord tasks = 1;
-  repeated AnchorRecord anchors = 2;
-}
-
-message TaskRecord {
-  string task_id = 1;
-  string description = 2;
-  string workspace = 3;
-  string resource = 4;
-  string status = 5;
-  string chat_id = 6;
-  string trigger = 7;
-  string created_at = 8;
-  string updated_at = 9;
-}
-
-// --- Shared message types ---
 
 message ChatMessage {
   string user_id = 1;
