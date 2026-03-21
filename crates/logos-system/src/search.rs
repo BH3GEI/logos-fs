@@ -16,6 +16,8 @@ pub async fn search_tasks(
     let limit = limit.clamp(1, 50);
 
     // L1 — Anchor facts BM25 match via FTS5 (RFC 003 §6.2)
+    // Escape query for FTS5 safety
+    let escaped_query = format!("\"{}\"", query.replace('"', "\"\""));
     let l1_rows = sqlx::query(
         "SELECT a.task_id, a.id, a.summary, a.facts, a.created_at
          FROM anchors_fts f
@@ -24,7 +26,7 @@ pub async fn search_tasks(
          ORDER BY f.rank
          LIMIT ?2",
     )
-    .bind(query)
+    .bind(&escaped_query)
     .bind(limit)
     .fetch_all(pool)
     .await
