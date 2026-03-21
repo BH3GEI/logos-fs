@@ -1,224 +1,226 @@
 # logos-fs
 
-Logos 数据内核 — 基于 URI 寻址的虚拟文件系统，通过 gRPC 提供 6 个 agent 原语，上层经 MCP (JSON-RPC 2.0) 适配后供 AI agent 使用。
+URI-addressed virtual filesystem data kernel. Exposes 6 agent primitives over gRPC, adapted to AI agents via MCP (JSON-RPC 2.0).
 
 ```
-AI Agent → MCP (JSON-RPC) → gRPC 内核 → VFS 路由表 → 命名空间
+AI Agent → MCP (JSON-RPC) → gRPC Kernel → VFS Routing Table → Namespaces
 ```
 
-## 一、gRPC 原语
+> [中文文档](./README.zh.md)
 
-| RPC | 输入 | 输出 | 语义 |
-|-----|------|------|------|
-| **Read** | uri | content | URI 路由 → namespace.read |
-| **Write** | uri, content | — | URI 路由 → namespace.write |
-| **Patch** | uri, partial | — | URI 路由 → namespace.patch（通常 JSON deep merge） |
-| **Exec** | command | stdout, stderr, exit_code | 沙箱容器执行 shell，命令中 `logos://` 自动翻译为容器路径 |
-| **Call** | tool, params_json | result_json | proc 工具分发（内置或外部 git 项目） |
-| **Complete** | summary, reply, anchor, task_log, sleep_reason, sleep_retry, resume_task_id, anchor_facts | reply, anchor_id | turn 终止符：写日志、建锚点、切任务、进睡眠 |
+## 1. gRPC Primitives
 
-管理接口（runtime 调用，非 agent 调用）：
+| RPC | Input | Output | Semantics |
+|-----|-------|--------|-----------|
+| **Read** | uri | content | URI-routed → namespace.read |
+| **Write** | uri, content | — | URI-routed → namespace.write |
+| **Patch** | uri, partial | — | URI-routed → namespace.patch (typically JSON deep merge) |
+| **Exec** | command | stdout, stderr, exit_code | Shell execution in sandbox container; `logos://` in commands auto-translated to container paths |
+| **Call** | tool, params_json | result_json | Proc tool dispatch (built-in or external git projects) |
+| **Complete** | summary, reply, anchor, task_log, sleep_reason, sleep_retry, resume_task_id, anchor_facts | reply, anchor_id | Turn terminator: write log, create anchor, switch task, enter sleep |
 
-| RPC | 用途 |
-|-----|------|
-| **Handshake** | 一次性 token 消费 → 绑定 session |
-| **RegisterToken** | runtime 预注册 token（token, task_id, role） |
-| **RevokeToken** | 撤销未使用的 token |
+Management interface (called by runtime, not agents):
 
-## 二、命名空间总览
+| RPC | Purpose |
+|-----|---------|
+| **Handshake** | Consume one-time token → bind session |
+| **RegisterToken** | Runtime pre-registers token (token, task_id, role) |
+| **RevokeToken** | Revoke unused token |
 
-| # | 命名空间 | 后端 | 持久 | 职责 |
-|---|---------|------|:----:|------|
-| 1 | **memory** | SQLite (per-gid) + FTS5 | ✓ | 聊天消息、三层摘要、视图查询 |
-| 2 | **system** | SQLite | ✓ | 任务状态机、锚点、搜索 |
-| 3 | **sandbox** | 宿主 FS → Docker bind-mount | ✓ | 每任务工作目录 + 执行环境 |
-| 4 | **users** | 文件系统 | ✓ | 用户档案、偏好、渐进式画像 |
-| 5 | **proc** | 内存 call slot | ✗ | 工具注册表 + 调用会话 |
-| 6 | **proc-store** | 文件系统 + git clone | ✓ | 外部工具声明与代码分发 |
-| 7 | **services** | 内存（boot 时从 svc-store 恢复） | ✗ | 活跃服务注册表 |
-| 8 | **svc-store** | 文件系统 | ✓ | 服务制品（compose.yaml 等） |
-| 9 | **devices** | 内存驱动注册 | ✗ | 硬件/虚拟设备抽象 |
-| 10 | **tmp** | 内存 HashMap | ✗ | 临时 KV，重启丢失 |
+## 2. Namespace Overview
 
-## 三、路径 × 操作矩阵
+| # | Namespace | Backend | Persistent | Purpose |
+|---|-----------|---------|:----------:|---------|
+| 1 | **memory** | SQLite (per-gid) + FTS5 | ✓ | Chat messages, 3-layer summaries, view queries |
+| 2 | **system** | SQLite | ✓ | Task state machine, anchors, search |
+| 3 | **sandbox** | Host FS → Docker bind-mount | ✓ | Per-task working directory + execution environment |
+| 4 | **users** | Filesystem | ✓ | User profiles, preferences, progressive persona |
+| 5 | **proc** | In-memory call slots | ✗ | Tool registry + call sessions |
+| 6 | **proc-store** | Filesystem + git clone | ✓ | External tool declarations & code distribution |
+| 7 | **services** | In-memory (restored from svc-store at boot) | ✗ | Active service registry |
+| 8 | **svc-store** | Filesystem | ✓ | Service artifacts (compose.yaml, etc.) |
+| 9 | **devices** | In-memory driver registry | ✗ | Hardware/virtual device abstraction |
+| 10 | **tmp** | In-memory HashMap | ✗ | Ephemeral KV, lost on restart |
 
-### 1. memory
+## 3. Path × Operation Matrix
 
-| 路径 | Read | Write | Patch |
+### 3.1 memory
+
+| Path | Read | Write | Patch |
 |------|------|-------|-------|
-| `groups/{gid}/messages` | "null" | **插入**消息（ts/speaker/text/mentions） | — |
-| `groups/{gid}/messages/{id}` | 单条消息 JSON | — | — |
-| `groups/{gid}/summary/{layer}/latest` | 最新摘要 | — | — |
-| `groups/{gid}/summary/{layer}/{period}` | 该期摘要 | 写入/覆盖 | **deep merge** |
-| `groups/{gid}/views/{name}` | 查询视图 | — | — |
+| `groups/{gid}/messages` | "null" | **Insert** message (ts/speaker/text/mentions) | — |
+| `groups/{gid}/messages/{id}` | Single message JSON | — | — |
+| `groups/{gid}/summary/{layer}/latest` | Latest summary | — | — |
+| `groups/{gid}/summary/{layer}/{period}` | Summary for period | Write/overwrite | **deep merge** |
+| `groups/{gid}/views/{name}` | Query view | — | — |
 
-> layer = short(小时) / mid(日) / long(月)；period = ISO8601（`2026-03-20T10` / `2026-03-20` / `2026-03`）
+> layer = short (hourly) / mid (daily) / long (monthly); period = ISO8601 (`2026-03-20T10` / `2026-03-20` / `2026-03`)
 
-### 2. system
+### 3.2 system
 
-| 路径 | Read | Write | Patch |
+| Path | Read | Write | Patch |
 |------|------|-------|-------|
-| `tasks` | 列出非 pending 任务 | 创建任务 | — |
-| `tasks/{id}` | 任务详情 | — | — |
-| `tasks/{id}/description` | — | 更新描述 | — |
-| `anchors/{task_id}` | 该任务所有锚点 | — | — |
-| `anchors/{task_id}/{anchor_id}` | 单个锚点 | — | — |
+| `tasks` | List non-pending tasks | Create task | — |
+| `tasks/{id}` | Task details | — | — |
+| `tasks/{id}/description` | — | Update description | — |
+| `anchors/{task_id}` | All anchors for task | — | — |
+| `anchors/{task_id}/{anchor_id}` | Single anchor | — | — |
 
-> 状态机：`pending → active ⇄ sleep → finished`
+> State machine: `pending → active ⇄ sleep → finished`
 
-### 3. sandbox
+### 3.3 sandbox
 
-| 路径 | Read | Write | Patch |
+| Path | Read | Write | Patch |
 |------|------|-------|-------|
-| `{task_id}/...` | 文件内容 / 目录列表 | 写文件（自动建父目录） | 覆盖 |
-| `{task_id}/log` | 读日志 | — | **追加**（换行分隔） |
-| `__system__/proc/{name}/` | 工具代码目录 | — | — |
-| `__system__/svc/{name}/` | 服务制品目录 | — | — |
+| `{task_id}/...` | File content / directory listing | Write file (auto-creates parents) | Overwrite |
+| `{task_id}/log` | Read log | — | **Append** (newline-delimited) |
+| `__system__/proc/{name}/` | Tool code directory | — | — |
+| `__system__/svc/{name}/` | Service artifact directory | — | — |
 
-> 容器内映射：`logos://sandbox/{task_id}/...` → `/workspace/...`
+> Container mapping: `logos://sandbox/{task_id}/...` → `/workspace/...`
 
-### 4. users
+### 3.4 users
 
-| 路径 | Read | Write | Patch |
+| Path | Read | Write | Patch |
 |------|------|-------|-------|
-| `{uid}/...` | 文件 / 目录列表 | 写文件 | **deep merge** JSON |
-| `{uid}/persona/short/{period}` | 读 | **追加** JSON 数组项 | — |
-| `{uid}/persona/mid/` | 读 | 覆盖 | — |
-| `{uid}/persona/long.md` | 读 | 覆盖 | — |
+| `{uid}/...` | File / directory listing | Write file | **deep merge** JSON |
+| `{uid}/persona/short/{period}` | Read | **Append** JSON array entry | — |
+| `{uid}/persona/mid/` | Read | Overwrite | — |
+| `{uid}/persona/long.md` | Read | Overwrite | — |
 
-### 5. proc
+### 3.5 proc
 
-| 路径 | Read | Write |
+| Path | Read | Write |
 |------|------|-------|
-| `/` | 列出所有工具名 | — |
-| `{tool}` 或 `{tool}/.schema` | 工具 schema JSON | — |
-| `{tool}/{call_id}/input` | 读回参数 | **提交参数 → 触发同步执行** |
-| `{tool}/{call_id}/output` | 取结果（**取后清除 slot**） | — |
-| `{tool}/{call_id}/error` | 错误 / "null" | — |
+| `/` | List all tool names | — |
+| `{tool}` or `{tool}/.schema` | Tool schema JSON | — |
+| `{tool}/{call_id}/input` | Read back params | **Submit params → trigger synchronous execution** |
+| `{tool}/{call_id}/output` | Get result (**slot cleared after read**) | — |
+| `{tool}/{call_id}/error` | Error / "null" | — |
 
-### 6. proc-store
+### 3.6 proc-store
 
-| 路径 | Read | Write |
+| Path | Read | Write |
 |------|------|-------|
-| `/` | 列出工具名 | — |
-| `{tool}/schema.json` | 工具声明 | **注册工具**（含 `run`、可选 `git`） |
-| `{tool}/...` | 其他文件 | 写文件 |
+| `/` | List tool names | — |
+| `{tool}/schema.json` | Tool declaration | **Register tool** (with `run` cmd, optional `git`) |
+| `{tool}/...` | Other files | Write file |
 
-> 有 `git` 字段 → 启动时 `git clone` 到 `sandbox/__system__/proc/{tool}/`，已有则 `git pull --ff-only`
+> If `git` field present → `git clone` to `sandbox/__system__/proc/{tool}/` at boot, `git pull --ff-only` if already cloned
 
-### 7. services
+### 3.7 services
 
-| 路径 | Read | Write | Patch |
+| Path | Read | Write | Patch |
 |------|------|-------|-------|
-| `/` | 列出服务名 | — | — |
-| `{name}` | ServiceEntry JSON | 注册/更新 | **deep merge** |
+| `/` | List service names | — | — |
+| `{name}` | ServiceEntry JSON | Register/update | **deep merge** |
 
-> ServiceEntry: name, source(builtin/agent), svc_type(oneshot/daemon), endpoint, status
+> ServiceEntry: name, source (builtin/agent), svc_type (oneshot/daemon), endpoint, status
 
-### 8. svc-store
+### 3.8 svc-store
 
-| 路径 | Read | Write |
+| Path | Read | Write |
 |------|------|-------|
-| `/` | 列出服务名 | — |
-| `{name}/compose.yaml` | 服务清单 | 写 |
-| `{name}/artifacts/...` | 构建制品 | 写 |
+| `/` | List service names | — |
+| `{name}/compose.yaml` | Service manifest | Write |
+| `{name}/artifacts/...` | Build artifacts | Write |
 
-### 9. devices
+### 3.9 devices
 
-| 路径 | Read | Write |
+| Path | Read | Write |
 |------|------|-------|
-| `/` | 列出设备名 | — |
-| `{name}` 或 `{name}/capabilities` | 能力 JSON | — |
+| `/` | List device names | — |
+| `{name}` or `{name}/capabilities` | Capabilities JSON | — |
 | `{name}/state` | `{volume, muted, dark_mode, battery_percent, battery_charging}` | — |
-| `{name}/control` | — | 发命令：`set_volume`/`mute`/`unmute`/`screenshot`/`dark_mode` |
+| `{name}/control` | — | Send command: `set_volume`/`mute`/`unmute`/`screenshot`/`dark_mode` |
 
-### 10. tmp
+### 3.10 tmp
 
-| 路径 | Read | Write | Patch |
+| Path | Read | Write | Patch |
 |------|------|-------|-------|
-| `/` | 列出所有 key | — | — |
-| `{key/path}` | 取值 | 存值 | 覆盖 |
+| `/` | List all keys | — | — |
+| `{key/path}` | Get value | Set value | Overwrite |
 
-## 四、内置 Proc 工具
+## 4. Built-in Proc Tools
 
-| 工具名 | 参数 | 功能 |
-|--------|------|------|
-| `memory.search` | chat_id, query, limit | FTS5 全文搜索 |
-| `memory.range_fetch` | chat_id, ranges, limit, offset | 消息范围批量取 |
-| `memory.view.by_speaker` | chat_id, speaker, limit | 按发言人过滤 |
-| `memory.view.recent` | chat_id, limit | 最近 N 条 |
-| `system.search_tasks` | query, limit | 任务+锚点多级检索 |
-| `system.get_context` | chat_id, sender_uid, msg_id? | 自动注入 session+摘要+画像 |
+| Tool | Params | Function |
+|------|--------|----------|
+| `memory.search` | chat_id, query, limit | FTS5 full-text search |
+| `memory.range_fetch` | chat_id, ranges, limit, offset | Batch message range fetch |
+| `memory.view.by_speaker` | chat_id, speaker, limit | Filter by speaker |
+| `memory.view.recent` | chat_id, limit | Most recent N messages |
+| `system.search_tasks` | query, limit | Multi-level task + anchor search |
+| `system.get_context` | chat_id, sender_uid, msg_id? | Auto-inject session + summary + persona |
 
-## 五、内核子系统
+## 5. Kernel Subsystems
 
-| 子系统 | 存储 | 职责 |
-|--------|------|------|
-| **Token Registry** | 内存（24h TTL） | 一次性 token → session 绑定；role = User / Admin |
-| **Session Clustering** | 内存 L0/L1 + LanceDB L2 | 基于 reply chain 的会话聚类，三层 LRU 淘汰 |
-| **Cron Scheduler** | 内存 job 表 | 60s tick，cron 表达式匹配 → 创建 pending task |
-| **Consolidator** | 注册 4 个 cron job | 渐进式记忆压缩：消息→小时摘要→日摘要；画像同理 |
-| **Context Injector** | 无状态 | turn 开始前组装 session + summary + persona |
-| **VFS Middleware** | — | JsonValidator：system/ 和 memory/ 写入前验证 JSON |
+| Subsystem | Storage | Purpose |
+|-----------|---------|---------|
+| **Token Registry** | In-memory (24h TTL) | One-time token → session binding; role = User / Admin |
+| **Session Clustering** | In-memory L0/L1 + LanceDB L2 | Reply-chain-based session clustering, 3-layer LRU eviction |
+| **Cron Scheduler** | In-memory job table | 60s tick, cron expression matching → create pending task |
+| **Consolidator** | 4 registered cron jobs | Progressive memory compression: messages → hourly → daily summaries; persona likewise |
+| **Context Injector** | Stateless | Assemble session + summary + persona before agent turn |
+| **VFS Middleware** | — | JsonValidator: validate JSON before writes to system/ and memory/ |
 
-### Consolidator 定时任务
+### Consolidator Cron Jobs
 
-| Cron Job | 频率 | 做什么 |
-|----------|------|--------|
-| `consolidate-short-summary` | 每小时 :00 | 原始消息 → short 摘要 |
-| `consolidate-short-persona` | 每小时 :05 | 原始消息 → 用户画像观察 |
-| `consolidate-mid-summary` | 每天 03:00 | short 摘要 → mid 摘要 |
-| `consolidate-mid-persona` | 每天 03:30 | short 画像 → 重写 mid 画像 |
+| Job | Frequency | Action |
+|-----|-----------|--------|
+| `consolidate-short-summary` | Hourly :00 | Raw messages → short summary |
+| `consolidate-short-persona` | Hourly :05 | Raw messages → persona observations |
+| `consolidate-mid-summary` | Daily 03:00 | Short summaries → mid summary |
+| `consolidate-mid-persona` | Daily 03:30 | Short persona → rewrite mid persona |
 
-### Session Clustering 三层 LRU
+### Session Clustering: 3-Layer LRU
 
-| 层 | 存储 | 用途 |
-|---|------|------|
-| L0 | 内存 HashMap | 活跃会话（最近有回复） |
-| L1 | 内存 HashMap | 不活跃（从 L0 LRU 淘汰） |
-| L2 | LanceDB | 归档（从 L1 淘汰时持久化，reply 时 page fault 加载回 L0） |
+| Layer | Storage | Purpose |
+|-------|---------|---------|
+| L0 | In-memory HashMap | Active sessions (recently replied to) |
+| L1 | In-memory HashMap | Inactive (LRU-evicted from L0) |
+| L2 | LanceDB | Archived (persisted on L1 eviction, page-faulted back to L0 on reply) |
 
-> 核心：reply chain 是硬绑定，语义相似度只是 fallback。
+> Core principle: reply chains are hard bindings; semantic similarity is only a fallback.
 
-## 六、访问控制
+## 6. Access Control
 
-| 规则 | 描述 |
-|------|------|
-| Sandbox 隔离 | task 只能访问 `sandbox/{own_task_id}/`，不能越界 |
-| 只读命名空间 | User 角色不可写 `services/`、`system/`、`devices/` |
-| 无 session = Admin | 管理接口调用（无 header）视为 admin |
-| JSON 校验 | `system/`、`memory/` 的 write/patch 前必须是合法 JSON |
+| Rule | Description |
+|------|-------------|
+| Sandbox isolation | Task can only access `sandbox/{own_task_id}/`, no cross-access |
+| Read-only namespaces | User role cannot write to `services/`, `system/`, `devices/` |
+| No session = Admin | Management interface calls (no header) treated as admin |
+| JSON validation | Writes/patches to `system/` and `memory/` must be valid JSON |
 
-## 七、MCP 适配层
+## 7. MCP Adapter
 
-| MCP 工具 | 映射到 |
-|----------|--------|
+| MCP Tool | Maps to |
+|----------|---------|
 | `logos_read` | gRPC Read |
 | `logos_write` | gRPC Write |
 | `logos_exec` | gRPC Exec |
 | `logos_call` | gRPC Call |
 | `logos_complete` | gRPC Complete |
 
-## 八、启动顺序
+## 8. Boot Sequence
 
 ```
-users → memory → system → tmp → sandbox(创建)
-→ proc(内置工具) → proc-store(恢复外部工具 + git clone)
-→ services(从 svc-store 恢复) → svc-store
-→ devices(macOS 驱动) → sandbox(挂载) → table.open()
-→ cron.start() + consolidator 注册 4 jobs
+users → memory → system → tmp → sandbox (create)
+→ proc (built-in tools) → proc-store (restore external tools + git clone)
+→ services (restore from svc-store) → svc-store
+→ devices (macOS driver) → sandbox (mount) → table.open()
+→ cron.start() + consolidator registers 4 jobs
 ```
 
-## 项目结构
+## Project Structure
 
 ```
 logos-fs/
-├── proto/logos.proto          # gRPC 服务定义
+├── proto/logos.proto          # gRPC service definition
 ├── crates/
-│   ├── logos-vfs/             # VFS 核心：Namespace trait, RoutingTable, URI 解析, Middleware
-│   ├── logos-kernel/          # 内核：gRPC 实现, 命名空间挂载, Token, Cron, Consolidator, Context
-│   ├── logos-mm/              # 记忆模块：消息存储, 摘要, 视图, FTS5
-│   ├── logos-system/          # 系统模块：任务状态机, 锚点, 搜索, Complete 处理
-│   ├── logos-session/         # 会话聚类：reply chain 拓扑, 三层 LRU, LanceDB L2
-│   └── logos-mcp/             # MCP 适配器：gRPC → JSON-RPC 2.0
+│   ├── logos-vfs/             # VFS core: Namespace trait, RoutingTable, URI parsing, Middleware
+│   ├── logos-kernel/          # Kernel: gRPC impl, namespace mounting, Token, Cron, Consolidator, Context
+│   ├── logos-mm/              # Memory module: message storage, summaries, views, FTS5
+│   ├── logos-system/          # System module: task state machine, anchors, search, Complete handler
+│   ├── logos-session/         # Session clustering: reply-chain topology, 3-layer LRU, LanceDB L2
+│   └── logos-mcp/             # MCP adapter: gRPC → JSON-RPC 2.0
 ```
