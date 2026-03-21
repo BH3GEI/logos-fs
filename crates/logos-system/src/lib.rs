@@ -39,6 +39,29 @@ impl SystemModule {
         Ok(Self { tasks, anchors })
     }
 
+    /// Multi-level experience retrieval (RFC 003 §6.2).
+    /// L1: BM25 on anchor facts. L2: FTS on task description.
+    /// Called by logos_call("system.search_tasks", params).
+    pub async fn search_tasks(&self, params: &str) -> Result<String, VfsError> {
+        let val: serde_json::Value =
+            serde_json::from_str(params).map_err(|e| VfsError::InvalidJson(e.to_string()))?;
+        let query = val["query"].as_str().unwrap_or_default();
+        let limit = val["limit"].as_i64().unwrap_or(5);
+
+        if query.is_empty() {
+            return Ok(r#"{"anchors":[],"tasks":[]}"#.to_string());
+        }
+
+        let anchor_results = self.anchors.search_fts(query, limit).await?;
+        let task_results = self.tasks.search_fts(query, limit).await?;
+
+        Ok(serde_json::json!({
+            "anchors": serde_json::from_str::<serde_json::Value>(&anchor_results).unwrap_or_default(),
+            "tasks": serde_json::from_str::<serde_json::Value>(&task_results).unwrap_or_default(),
+        })
+        .to_string())
+    }
+
     /// Execute logos_complete. Called by the gRPC layer directly, not through Namespace trait.
     pub async fn complete(
         &self,

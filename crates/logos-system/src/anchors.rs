@@ -61,6 +61,35 @@ impl AnchorDb {
         .map_err(|e| VfsError::Io(e.to_string()))?
     }
 
+    /// BM25 search over anchor facts (L1 experience retrieval).
+    pub async fn search_fts(&self, query: &str, limit: i64) -> Result<String, VfsError> {
+        let conn = Arc::clone(&self.conn);
+        let query = query.to_string();
+        let limit = limit.clamp(1, 50);
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().map_err(|e| VfsError::Sqlite(e.to_string()))?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT a.id, a.task_id, a.summary, a.facts, a.created_at
+                     FROM anchors_fts f
+                     JOIN anchors a ON a.rowid = f.rowid
+                     WHERE anchors_fts MATCH ?1
+                     ORDER BY f.rank
+                     LIMIT ?2",
+                )
+                .map_err(|e| VfsError::Sqlite(e.to_string()))?;
+            let rows: Vec<serde_json::Value> = stmt
+                .query_map(rusqlite::params![query, limit], anchor_row_to_json)
+                .map_err(|e| VfsError::Sqlite(e.to_string()))?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok(serde_json::to_string(&rows).unwrap_or_else(|_| "[]".to_string()))
+        })
+        .await
+        .map_err(|e| VfsError::Io(e.to_string()))?
+    }
+
     pub(crate) fn create_sync(
         conn: &Connection,
         task_id: &str,

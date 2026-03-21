@@ -8,7 +8,7 @@ logos-vfs = { path = "../logos-vfs" }
 logos-mm = { path = "../logos-mm" }
 logos-system = { path = "../logos-system" }
 async-trait = "0.1"
-tokio = { version = "1", features = ["fs", "macros", "net", "rt-multi-thread", "sync"] }
+tokio = { version = "1", features = ["fs", "macros", "net", "process", "rt-multi-thread", "sync"] }
 tonic = { version = "0.14.5", features = ["transport"] }
 tonic-prost = "0.14.2"
 prost = "0.14.3"

@@ -23,6 +23,17 @@ pub struct MemoryModule {
 }
 
 impl MemoryModule {
+    /// Vector similarity search over archived sessions.
+    /// Called by logos_call("memory.vsearch", params).
+    pub async fn vsearch(&self, params: &str) -> Result<String, VfsError> {
+        let val: serde_json::Value =
+            serde_json::from_str(params).map_err(|e| VfsError::InvalidJson(e.to_string()))?;
+        let chat_id = val["chat_id"].as_str().unwrap_or_default();
+        self.messages.vsearch(chat_id, params).await
+    }
+}
+
+impl MemoryModule {
     pub fn init(db_root: PathBuf) -> Result<Self, VfsError> {
         let messages = MessageDb::new(db_root)?;
         Ok(Self { messages })

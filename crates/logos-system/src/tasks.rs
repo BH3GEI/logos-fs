@@ -143,6 +143,35 @@ impl TaskDb {
         .map_err(|e| VfsError::Io(e.to_string()))?
     }
 
+    /// FTS search over task descriptions (L2 experience retrieval).
+    pub async fn search_fts(&self, query: &str, limit: i64) -> Result<String, VfsError> {
+        let conn = Arc::clone(&self.conn);
+        let query = query.to_string();
+        let limit = limit.clamp(1, 50);
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().map_err(|e| VfsError::Sqlite(e.to_string()))?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT t.task_id, t.description, t.workspace, t.resource, t.status, t.chat_id, t.trigger, t.created_at, t.updated_at
+                     FROM tasks_fts f
+                     JOIN tasks t ON t.rowid = f.rowid
+                     WHERE tasks_fts MATCH ?1
+                     ORDER BY f.rank
+                     LIMIT ?2",
+                )
+                .map_err(|e| VfsError::Sqlite(e.to_string()))?;
+            let rows: Vec<serde_json::Value> = stmt
+                .query_map(rusqlite::params![query, limit], task_row_to_json)
+                .map_err(|e| VfsError::Sqlite(e.to_string()))?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok(serde_json::to_string(&rows).unwrap_or_else(|_| "[]".to_string()))
+        })
+        .await
+        .map_err(|e| VfsError::Io(e.to_string()))?
+    }
+
     pub(crate) fn transition_status_sync(
         conn: &Connection,
         task_id: &str,

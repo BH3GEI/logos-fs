@@ -1,4 +1,5 @@
 mod grpc;
+mod sandbox;
 mod tmp;
 mod token;
 mod users;
@@ -35,7 +36,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 2. memory/
     let memory_root = env_path("VFS_MEMORY_ROOT", "../../data/state/memory");
     let memory_ns = logos_mm::MemoryModule::init(memory_root)?;
-    table.mount(Box::new(memory_ns));
+    let mm_arc = Arc::new(memory_ns);
+    table.mount(Box::new(MemoryNsRef(Arc::clone(&mm_arc))));
     println!("[logos] mounted logos://memory/");
 
     // 3. system/
@@ -46,7 +48,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     table.mount(Box::new(SystemNsRef(Arc::clone(&system_arc))));
     println!("[logos] mounted logos://system/");
 
-    // 4. tmp/
+    // 4. sandbox/
+    let sandbox_root = env_path("VFS_SANDBOX_ROOT", "../../data/state/sandbox");
+    let sandbox_ns = sandbox::SandboxNs::init(sandbox_root)?;
+    let sandbox_arc = Arc::new(sandbox_ns);
+    table.mount(Box::new(SandboxNsRef(Arc::clone(&sandbox_arc))));
+    println!("[logos] mounted logos://sandbox/");
+
+    // 5. tmp/
     table.mount(Box::new(tmp::TmpNs::new()));
     println!("[logos] mounted logos://tmp/");
 
@@ -60,7 +69,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Serve ---
     let table = Arc::new(table);
     let tokens = token::TokenRegistry::new();
-    let service = grpc::LogosService::new(Arc::clone(&table), system_arc, tokens);
+    let service = grpc::LogosService::new(
+        Arc::clone(&table),
+        system_arc,
+        mm_arc,
+        sandbox_arc,
+        tokens,
+    );
     let grpc_service = pb::logos_server::LogosServer::new(service);
 
     let listen = env_str("VFS_LISTEN", "unix:///run/logos/logos.sock");
@@ -87,6 +102,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 // --- SystemModule Namespace wrapper ---
 // SystemModule implements Namespace, but we need to mount it as Box<dyn Namespace>
 // while also keeping an Arc for the Complete handler. This wrapper delegates.
+struct MemoryNsRef(Arc<logos_mm::MemoryModule>);
+
+#[async_trait::async_trait]
+impl logos_vfs::Namespace for MemoryNsRef {
+    fn name(&self) -> &str { self.0.name() }
+    async fn read(&self, path: &[&str]) -> Result<String, logos_vfs::VfsError> { self.0.read(path).await }
+    async fn write(&self, path: &[&str], content: &str) -> Result<(), logos_vfs::VfsError> { self.0.write(path, content).await }
+    async fn patch(&self, path: &[&str], partial: &str) -> Result<(), logos_vfs::VfsError> { self.0.patch(path, partial).await }
+}
+
+struct SandboxNsRef(Arc<sandbox::SandboxNs>);
+
+#[async_trait::async_trait]
+impl logos_vfs::Namespace for SandboxNsRef {
+    fn name(&self) -> &str { self.0.name() }
+    async fn read(&self, path: &[&str]) -> Result<String, logos_vfs::VfsError> { self.0.read(path).await }
+    async fn write(&self, path: &[&str], content: &str) -> Result<(), logos_vfs::VfsError> { self.0.write(path, content).await }
+    async fn patch(&self, path: &[&str], partial: &str) -> Result<(), logos_vfs::VfsError> { self.0.patch(path, partial).await }
+}
+
 struct SystemNsRef(Arc<logos_system::SystemModule>);
 
 #[async_trait::async_trait]

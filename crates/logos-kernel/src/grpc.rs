@@ -4,16 +4,17 @@ use tonic::{Request, Response, Status};
 
 use crate::pb::logos_server::Logos;
 use crate::pb::*;
+use crate::sandbox::SandboxNs;
 use crate::token::TokenRegistry;
 use logos_vfs::{RoutingTable, VfsError};
 
-/// The metadata key used to pass the session key after Handshake.
-/// Client sends this in every request after a successful handshake.
 const SESSION_KEY_HEADER: &str = "x-logos-session";
 
 pub struct LogosService {
     table: Arc<RoutingTable>,
     system: Arc<logos_system::SystemModule>,
+    mm: Arc<logos_mm::MemoryModule>,
+    sandbox: Arc<SandboxNs>,
     tokens: Arc<TokenRegistry>,
 }
 
@@ -21,23 +22,25 @@ impl LogosService {
     pub fn new(
         table: Arc<RoutingTable>,
         system: Arc<logos_system::SystemModule>,
+        mm: Arc<logos_mm::MemoryModule>,
+        sandbox: Arc<SandboxNs>,
         tokens: Arc<TokenRegistry>,
     ) -> Self {
         Self {
             table,
             system,
+            mm,
+            sandbox,
             tokens,
         }
     }
 }
 
-/// Extract task_id from request metadata via session key.
-async fn extract_task_id(tokens: &TokenRegistry, request: &Request<impl std::any::Any>) -> Option<String> {
-    let session_key = request
-        .metadata()
-        .get(SESSION_KEY_HEADER)?
-        .to_str()
-        .ok()?;
+async fn extract_task_id(
+    tokens: &TokenRegistry,
+    request: &Request<impl std::any::Any>,
+) -> Option<String> {
+    let session_key = request.metadata().get(SESSION_KEY_HEADER)?.to_str().ok()?;
     tokens.resolve(session_key).await
 }
 
@@ -80,12 +83,29 @@ impl Logos for LogosService {
         Ok(Response::new(PatchRes {}))
     }
 
-    async fn exec(&self, _request: Request<ExecReq>) -> Result<Response<ExecRes>, Status> {
-        Err(Status::unimplemented("sandbox not mounted"))
+    async fn exec(&self, request: Request<ExecReq>) -> Result<Response<ExecRes>, Status> {
+        let command = request.into_inner().command;
+        let result = self.sandbox.exec(&command).await.map_err(vfs_to_status)?;
+        Ok(Response::new(ExecRes {
+            stdout: result.stdout,
+            stderr: result.stderr,
+            exit_code: result.exit_code,
+        }))
     }
 
-    async fn call(&self, _request: Request<CallReq>) -> Result<Response<CallRes>, Status> {
-        Err(Status::unimplemented("proc not mounted"))
+    async fn call(&self, request: Request<CallReq>) -> Result<Response<CallRes>, Status> {
+        let req = request.into_inner();
+        let result_json = match req.tool.as_str() {
+            "memory.vsearch" => self.mm.vsearch(&req.params_json).await.map_err(vfs_to_status)?,
+            "system.search_tasks" => {
+                self.system
+                    .search_tasks(&req.params_json)
+                    .await
+                    .map_err(vfs_to_status)?
+            }
+            _ => return Err(Status::not_found(format!("unknown tool: {}", req.tool))),
+        };
+        Ok(Response::new(CallRes { result_json }))
     }
 
     async fn complete(
@@ -127,12 +147,8 @@ impl Logos for LogosService {
                     ok: true,
                     error: String::new(),
                 });
-                // Return session key in response metadata — client must send it back
-                // in subsequent requests as x-logos-session header.
-                res.metadata_mut().insert(
-                    SESSION_KEY_HEADER,
-                    session_key.parse().unwrap(),
-                );
+                res.metadata_mut()
+                    .insert(SESSION_KEY_HEADER, session_key.parse().unwrap());
                 Ok(res)
             }
             None => Ok(Response::new(HandshakeRes {
