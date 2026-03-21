@@ -123,6 +123,10 @@ impl MessageDb {
         let pool = self.pool(chat_id).await?;
         let limit = limit.clamp(1, FTS_MAX_LIMIT);
 
+        // Escape query for FTS5: wrap in double quotes to treat as phrase,
+        // and escape any internal double quotes.
+        let escaped = format!("\"{}\"", query.replace('"', "\"\""));
+
         let rows = sqlx::query(
             "SELECT m.msg_id, m.ts, m.chat_id, m.speaker, m.reply_to, m.text, m.mentions
              FROM messages_fts f
@@ -131,7 +135,7 @@ impl MessageDb {
              ORDER BY f.rank
              LIMIT ?2",
         )
-        .bind(query)
+        .bind(&escaped)
         .bind(limit)
         .fetch_all(&pool)
         .await
