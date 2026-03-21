@@ -35,9 +35,22 @@ impl UsersNs {
             .map_err(|e| VfsError::Io(format!("write {}: {e}", file_path.display())))
     }
 
-    /// Append a new entry to the persona/short JSON array file.
+    /// Append a new entry to persona/short/{period} file.
+    ///
+    /// RFC 003 §8.1: short is append-only, one entry per hour.
+    /// Path: logos://users/{uid}/persona/short/{period}
+    /// If no period in path, appends to a default file.
+    /// Each file is a JSON array; each write appends one entry.
     async fn append_persona_short(&self, path: &[&str], content: &str) -> Result<(), VfsError> {
-        let file_path = self.root.join(path.join("/"));
+        // path: [uid, "persona", "short", period?]
+        let file_path = if path.len() >= 4 {
+            // logos://users/{uid}/persona/short/{period}
+            self.root.join(path.join("/"))
+        } else {
+            // logos://users/{uid}/persona/short → use "latest" as default
+            self.root.join(format!("{}/persona/short/latest", path[0]))
+        };
+
         let existing = tokio::fs::read_to_string(&file_path)
             .await
             .unwrap_or_else(|_| "[]".to_string());
@@ -47,7 +60,15 @@ impl UsersNs {
             .unwrap_or(serde_json::Value::String(content.to_string()));
         entries.push(new_entry);
         let merged = serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string());
-        self.write_file(path, &merged).await
+
+        if let Some(parent) = file_path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| VfsError::Io(format!("mkdir {}: {e}", parent.display())))?;
+        }
+        tokio::fs::write(&file_path, merged)
+            .await
+            .map_err(|e| VfsError::Io(format!("write {}: {e}", file_path.display())))
     }
 }
 

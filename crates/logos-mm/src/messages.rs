@@ -29,7 +29,9 @@ impl MessageDb {
         })
     }
 
-    async fn conn(&self, chat_id: &str) -> Result<Arc<std::sync::Mutex<Connection>>, VfsError> {
+    /// Get or create a pooled connection for a chat_id.
+    /// Also used by SummaryDb to share the same per-group connection.
+    pub(crate) async fn conn(&self, chat_id: &str) -> Result<Arc<std::sync::Mutex<Connection>>, VfsError> {
         let mut map = self.connections.lock().await;
         if let Some(c) = map.get(chat_id) {
             return Ok(Arc::clone(c));

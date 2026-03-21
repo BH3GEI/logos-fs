@@ -4,29 +4,42 @@ use rusqlite::Connection;
 
 use logos_vfs::VfsError;
 
-/// Summary tree storage — shared SQLite database with the messages for each group.
+/// Summary tree storage.
 ///
+/// Shares the per-group SQLite connection with MessageDb.
 /// Summaries are written by the consolidator (userspace cron) via `logos_write`,
 /// and read by agents via `logos_read`. The kernel never generates summaries itself.
-pub struct SummaryDb {
-    conn: Arc<std::sync::Mutex<Connection>>,
-}
+pub struct SummaryDb;
 
 impl SummaryDb {
-    pub fn new(conn: Arc<std::sync::Mutex<Connection>>) -> Result<Self, VfsError> {
-        {
-            let c = conn.lock().map_err(|e| VfsError::Sqlite(e.to_string()))?;
-            init_schema(&c)?;
-        }
-        Ok(Self { conn })
+    pub fn ensure_schema(conn: &Connection) -> Result<(), VfsError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS summaries (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id       TEXT NOT NULL,
+                layer         TEXT NOT NULL,
+                period_start  TEXT NOT NULL,
+                period_end    TEXT NOT NULL,
+                source_refs   TEXT NOT NULL DEFAULT '[]',
+                content       TEXT NOT NULL,
+                generated_at  TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_summaries_chat_layer
+                ON summaries(chat_id, layer, period_start);",
+        )
+        .map_err(|e| VfsError::Sqlite(format!("init summaries schema: {e}")))?;
+        Ok(())
     }
 
     /// Write a summary. `content` is JSON with fields:
     /// `layer`, `period_start`, `period_end`, `source_refs`, `content`
-    pub async fn write(&self, chat_id: &str, content: &str) -> Result<(), VfsError> {
+    pub async fn write(
+        conn: Arc<std::sync::Mutex<Connection>>,
+        chat_id: &str,
+        content: &str,
+    ) -> Result<(), VfsError> {
         let val: serde_json::Value =
             serde_json::from_str(content).map_err(|e| VfsError::InvalidJson(e.to_string()))?;
-        let conn = Arc::clone(&self.conn);
         let chat_id = chat_id.to_string();
 
         tokio::task::spawn_blocking(move || {
@@ -56,12 +69,11 @@ impl SummaryDb {
 
     /// Read a summary by layer + period key. If `period_key` is "latest", returns the most recent.
     pub async fn read(
-        &self,
+        conn: Arc<std::sync::Mutex<Connection>>,
         chat_id: &str,
         layer: &str,
         period_key: &str,
     ) -> Result<Option<String>, VfsError> {
-        let conn = Arc::clone(&self.conn);
         let chat_id = chat_id.to_string();
         let layer = layer.to_string();
         let period_key = period_key.to_string();
@@ -107,23 +119,4 @@ impl SummaryDb {
         .await
         .map_err(|e| VfsError::Io(e.to_string()))?
     }
-}
-
-fn init_schema(conn: &Connection) -> Result<(), VfsError> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS summaries (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id       TEXT NOT NULL,
-            layer         TEXT NOT NULL,
-            period_start  TEXT NOT NULL,
-            period_end    TEXT NOT NULL,
-            source_refs   TEXT NOT NULL DEFAULT '[]',
-            content       TEXT NOT NULL,
-            generated_at  TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_summaries_chat_layer
-            ON summaries(chat_id, layer, period_start);",
-    )
-    .map_err(|e| VfsError::Sqlite(format!("init summaries schema: {e}")))?;
-    Ok(())
 }

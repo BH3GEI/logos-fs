@@ -23,6 +23,7 @@ service Logos {
   // Kernel management interface (runtime-facing, not agent-facing)
   rpc Handshake(HandshakeReq) returns (HandshakeRes);
   rpc RegisterToken(RegisterTokenReq) returns (RegisterTokenRes);
+  rpc RevokeToken(RevokeTokenReq) returns (RevokeTokenRes);
 }
 
 // --- Read / Write / Patch: URI-routed data operations ---
@@ -63,7 +64,10 @@ message CompleteReq {
   string anchor_facts = 8;     // optional: JSON array of fact objects for the anchor
 }
 
-message CompleteRes {}
+message CompleteRes {
+  string reply = 1;            // echo back for adapter delivery
+  string anchor_id = 2;        // created anchor ID, empty if anchor was false
+}
 
 // --- Kernel management: token-based task binding ---
 
@@ -72,3 +76,6 @@ message HandshakeRes { bool ok = 1; string error = 2; }
 
 message RegisterTokenReq { string token = 1; string task_id = 2; }
 message RegisterTokenRes {}
+
+message RevokeTokenReq { string token = 1; }
+message RevokeTokenRes {}

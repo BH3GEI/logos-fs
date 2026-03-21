@@ -107,8 +107,11 @@ impl Logos for LogosService {
             sleep_retry: req.sleep_retry,
             resume_task_id: req.resume_task_id,
         };
-        self.system.complete(params).await.map_err(vfs_to_status)?;
-        Ok(Response::new(CompleteRes {}))
+        let result = self.system.complete(params).await.map_err(vfs_to_status)?;
+        Ok(Response::new(CompleteRes {
+            reply: result.reply,
+            anchor_id: result.anchor_id,
+        }))
     }
 
     // --- Kernel management interface ---
@@ -149,5 +152,14 @@ impl Logos for LogosService {
         }
         self.tokens.register(req.token, req.task_id).await;
         Ok(Response::new(RegisterTokenRes {}))
+    }
+
+    async fn revoke_token(
+        &self,
+        request: Request<RevokeTokenReq>,
+    ) -> Result<Response<RevokeTokenRes>, Status> {
+        let token = request.into_inner().token;
+        self.tokens.revoke(&token).await;
+        Ok(Response::new(RevokeTokenRes {}))
     }
 }

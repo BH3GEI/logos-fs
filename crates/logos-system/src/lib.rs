@@ -40,8 +40,11 @@ impl SystemModule {
     }
 
     /// Execute logos_complete. Called by the gRPC layer directly, not through Namespace trait.
-    pub async fn complete(&self, params: complete::CompleteParams) -> Result<(), VfsError> {
-        complete::execute(&self.tasks, &self.anchors, params).await
+    pub async fn complete(
+        &self,
+        params: complete::CompleteParams,
+    ) -> Result<complete::CompleteResult, VfsError> {
+        complete::execute(&self.tasks, params).await
     }
 }
 

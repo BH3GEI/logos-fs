@@ -32,7 +32,8 @@ impl TaskDb {
 
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().map_err(|e| VfsError::Sqlite(e.to_string()))?;
-            let mut sql = "SELECT task_id, description, workspace, resource, status, chat_id, trigger, created_at, updated_at FROM tasks WHERE 1=1".to_string();
+            // RFC 002 §4.3: agents never observe pending tasks
+            let mut sql = "SELECT task_id, description, workspace, resource, status, chat_id, trigger, created_at, updated_at FROM tasks WHERE status != 'pending'".to_string();
             let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
             if let Some(ref cid) = chat_id {
                 sql.push_str(&format!(" AND chat_id = ?{}", params.len() + 1));
@@ -98,6 +99,14 @@ impl TaskDb {
                 ],
             )
             .map_err(|e| VfsError::Sqlite(format!("insert task: {e}")))?;
+
+            // Sync FTS for L2 experience retrieval (RFC 003 §6.2)
+            conn.execute(
+                "INSERT INTO tasks_fts(rowid, description) SELECT rowid, description FROM tasks WHERE task_id = ?1",
+                rusqlite::params![val["task_id"].as_str().unwrap_or_default()],
+            )
+            .map_err(|e| VfsError::Sqlite(format!("sync task FTS: {e}")))?;
+
             Ok(())
         })
         .await
@@ -116,6 +125,18 @@ impl TaskDb {
                 rusqlite::params![description, now(), task_id],
             )
             .map_err(|e| VfsError::Sqlite(format!("update description: {e}")))?;
+
+            // Sync FTS
+            conn.execute(
+                "DELETE FROM tasks_fts WHERE rowid = (SELECT rowid FROM tasks WHERE task_id = ?1)",
+                rusqlite::params![task_id],
+            ).ok(); // ignore if no previous entry
+            conn.execute(
+                "INSERT INTO tasks_fts(rowid, description) SELECT rowid, description FROM tasks WHERE task_id = ?1",
+                rusqlite::params![task_id],
+            )
+            .map_err(|e| VfsError::Sqlite(format!("sync task FTS on update: {e}")))?;
+
             Ok(())
         })
         .await
@@ -179,7 +200,8 @@ fn init_schema(conn: &Connection) -> Result<(), VfsError> {
             trigger     TEXT NOT NULL DEFAULT 'user_message',
             created_at  TEXT NOT NULL,
             updated_at  TEXT NOT NULL
-        );",
+        );
+        CREATE VIRTUAL TABLE IF NOT EXISTS tasks_fts USING fts5(description, content='tasks', content_rowid='rowid');",
     )
     .map_err(|e| VfsError::Sqlite(format!("init tasks schema: {e}")))?;
     Ok(())

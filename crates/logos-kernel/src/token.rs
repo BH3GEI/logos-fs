@@ -1,7 +1,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::sync::RwLock;
+
+const SESSION_TTL: Duration = Duration::from_secs(24 * 3600); // 24 hours
+const CLEANUP_INTERVAL: Duration = Duration::from_secs(3600); // 1 hour
 
 /// One-time token registry for task binding.
 ///
@@ -12,30 +16,46 @@ use tokio::sync::RwLock;
 ///   4. Kernel consumes token → binds connection to task_id
 ///   5. All subsequent calls on this connection are scoped to that task
 pub struct TokenRegistry {
-    /// Pending tokens: token → task_id. Consumed on handshake.
     pending: RwLock<HashMap<String, String>>,
-    /// Active sessions: session_key → task_id. Set after handshake.
-    sessions: RwLock<HashMap<String, String>>,
-    /// Counter for generating session keys.
+    sessions: RwLock<HashMap<String, SessionEntry>>,
     counter: std::sync::atomic::AtomicU64,
+}
+
+struct SessionEntry {
+    task_id: String,
+    created_at: Instant,
 }
 
 impl TokenRegistry {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self {
+        let registry = Arc::new(Self {
             pending: RwLock::new(HashMap::new()),
             sessions: RwLock::new(HashMap::new()),
             counter: std::sync::atomic::AtomicU64::new(1),
-        })
+        });
+
+        // Background TTL cleanup
+        let weak = Arc::clone(&registry);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(CLEANUP_INTERVAL);
+            loop {
+                interval.tick().await;
+                weak.cleanup_expired().await;
+            }
+        });
+
+        registry
     }
 
-    /// Register a one-time token → task_id mapping. Called by the runtime.
     pub async fn register(&self, token: String, task_id: String) {
         self.pending.write().await.insert(token, task_id);
     }
 
-    /// Consume a token and return (session_key, task_id).
-    /// The token is invalidated after this call.
+    /// Revoke a pending token (RFC 002 §8.2).
+    pub async fn revoke(&self, token: &str) {
+        self.pending.write().await.remove(token);
+    }
+
     pub async fn consume(&self, token: &str) -> Option<(String, String)> {
         let task_id = self.pending.write().await.remove(token)?;
         let session_key = format!(
@@ -43,16 +63,30 @@ impl TokenRegistry {
             self.counter
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
-        self.sessions
-            .write()
-            .await
-            .insert(session_key.clone(), task_id.clone());
+        self.sessions.write().await.insert(
+            session_key.clone(),
+            SessionEntry {
+                task_id: task_id.clone(),
+                created_at: Instant::now(),
+            },
+        );
         Some((session_key, task_id))
     }
 
-    /// Look up the task_id for a session key.
     pub async fn resolve(&self, session_key: &str) -> Option<String> {
-        self.sessions.read().await.get(session_key).cloned()
+        self.sessions
+            .read()
+            .await
+            .get(session_key)
+            .map(|e| e.task_id.clone())
+    }
+
+    async fn cleanup_expired(&self) {
+        let now = Instant::now();
+        self.sessions
+            .write()
+            .await
+            .retain(|_, entry| now.duration_since(entry.created_at) < SESSION_TTL);
     }
 }
 
@@ -76,7 +110,7 @@ mod tests {
         reg.register("tok-2".to_string(), "task-002".to_string())
             .await;
         assert!(reg.consume("tok-2").await.is_some());
-        assert!(reg.consume("tok-2").await.is_none()); // second consume fails
+        assert!(reg.consume("tok-2").await.is_none());
     }
 
     #[tokio::test]
@@ -92,5 +126,14 @@ mod tests {
             .await;
         let (key, _) = reg.consume("tok-3").await.unwrap();
         assert_eq!(reg.resolve(&key).await, Some("task-003".to_string()));
+    }
+
+    #[tokio::test]
+    async fn revoke_pending_token() {
+        let reg = TokenRegistry::new();
+        reg.register("tok-4".to_string(), "task-004".to_string())
+            .await;
+        reg.revoke("tok-4").await;
+        assert!(reg.consume("tok-4").await.is_none());
     }
 }

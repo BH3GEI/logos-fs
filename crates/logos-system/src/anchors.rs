@@ -75,6 +75,15 @@ impl AnchorDb {
             rusqlite::params![anchor_id, task_id, summary, facts, now],
         )
         .map_err(|e| VfsError::Sqlite(format!("insert anchor: {e}")))?;
+
+        // Sync FTS index for L1 experience retrieval (RFC 003 §6.2)
+        conn.execute(
+            "INSERT INTO anchors_fts(rowid, facts)
+             SELECT rowid, facts FROM anchors WHERE id = ?1 AND task_id = ?2",
+            rusqlite::params![anchor_id, task_id],
+        )
+        .map_err(|e| VfsError::Sqlite(format!("sync anchor FTS: {e}")))?;
+
         Ok(anchor_id)
     }
 }
@@ -99,7 +108,8 @@ fn init_schema(conn: &Connection) -> Result<(), VfsError> {
             created_at TEXT NOT NULL,
             PRIMARY KEY (task_id, id)
         );
-        CREATE INDEX IF NOT EXISTS idx_anchors_task ON anchors(task_id, created_at);",
+        CREATE INDEX IF NOT EXISTS idx_anchors_task ON anchors(task_id, created_at);
+        CREATE VIRTUAL TABLE IF NOT EXISTS anchors_fts USING fts5(facts, content='anchors', content_rowid='rowid');",
     )
     .map_err(|e| VfsError::Sqlite(format!("init anchors schema: {e}")))?;
     Ok(())
