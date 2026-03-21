@@ -4,25 +4,58 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::RwLock;
 
-const SESSION_TTL: Duration = Duration::from_secs(24 * 3600); // 24 hours
-const CLEANUP_INTERVAL: Duration = Duration::from_secs(3600); // 1 hour
+const SESSION_TTL: Duration = Duration::from_secs(24 * 3600);
+const CLEANUP_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// Agent role — determines namespace permissions (RFC 002 §12.3).
+#[derive(Debug, Clone, PartialEq)]
+pub enum AgentRole {
+    User,
+    Admin,
+}
+
+impl AgentRole {
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "admin" => Self::Admin,
+            _ => Self::User,
+        }
+    }
+
+    pub fn is_admin(&self) -> bool {
+        matches!(self, Self::Admin)
+    }
+}
+
+/// Session info resolved from a connection header.
+#[derive(Debug, Clone)]
+pub struct SessionInfo {
+    pub task_id: String,
+    pub role: AgentRole,
+}
 
 /// One-time token registry for task binding.
 ///
 /// Flow (RFC 002 §11.2):
-///   1. Runtime calls RegisterToken(token, task_id)
+///   1. Runtime calls RegisterToken(token, task_id, role)
 ///   2. Runtime launches agent with token in env
 ///   3. Agent connects and calls Handshake(token)
-///   4. Kernel consumes token → binds connection to task_id
+///   4. Kernel consumes token → binds connection to task_id + role
 ///   5. All subsequent calls on this connection are scoped to that task
 pub struct TokenRegistry {
-    pending: RwLock<HashMap<String, String>>,
+    pending: RwLock<HashMap<String, PendingEntry>>,
     sessions: RwLock<HashMap<String, SessionEntry>>,
     counter: std::sync::atomic::AtomicU64,
 }
 
+struct PendingEntry {
+    task_id: String,
+    role: AgentRole,
+}
+
 struct SessionEntry {
     task_id: String,
+    role: AgentRole,
     created_at: Instant,
 }
 
@@ -34,7 +67,6 @@ impl TokenRegistry {
             counter: std::sync::atomic::AtomicU64::new(1),
         });
 
-        // Background TTL cleanup
         let weak = Arc::clone(&registry);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(CLEANUP_INTERVAL);
@@ -47,17 +79,19 @@ impl TokenRegistry {
         registry
     }
 
-    pub async fn register(&self, token: String, task_id: String) {
-        self.pending.write().await.insert(token, task_id);
+    pub async fn register(&self, token: String, task_id: String, role: AgentRole) {
+        self.pending
+            .write()
+            .await
+            .insert(token, PendingEntry { task_id, role });
     }
 
-    /// Revoke a pending token (RFC 002 §8.2).
     pub async fn revoke(&self, token: &str) {
         self.pending.write().await.remove(token);
     }
 
     pub async fn consume(&self, token: &str) -> Option<(String, String)> {
-        let task_id = self.pending.write().await.remove(token)?;
+        let entry = self.pending.write().await.remove(token)?;
         let session_key = format!(
             "s-{}",
             self.counter
@@ -66,19 +100,29 @@ impl TokenRegistry {
         self.sessions.write().await.insert(
             session_key.clone(),
             SessionEntry {
-                task_id: task_id.clone(),
+                task_id: entry.task_id.clone(),
+                role: entry.role,
                 created_at: Instant::now(),
             },
         );
-        Some((session_key, task_id))
+        Some((session_key, entry.task_id))
     }
 
+    /// Resolve a session key to task_id (backward compat).
     pub async fn resolve(&self, session_key: &str) -> Option<String> {
         self.sessions
             .read()
             .await
             .get(session_key)
             .map(|e| e.task_id.clone())
+    }
+
+    /// Resolve a session key to full session info (task_id + role).
+    pub async fn resolve_info(&self, session_key: &str) -> Option<SessionInfo> {
+        self.sessions.read().await.get(session_key).map(|e| SessionInfo {
+            task_id: e.task_id.clone(),
+            role: e.role.clone(),
+        })
     }
 
     async fn cleanup_expired(&self) {
@@ -97,7 +141,7 @@ mod tests {
     #[tokio::test]
     async fn register_and_consume() {
         let reg = TokenRegistry::new();
-        reg.register("tok-1".to_string(), "task-001".to_string())
+        reg.register("tok-1".to_string(), "task-001".to_string(), AgentRole::User)
             .await;
         let (key, task_id) = reg.consume("tok-1").await.unwrap();
         assert_eq!(task_id, "task-001");
@@ -107,7 +151,7 @@ mod tests {
     #[tokio::test]
     async fn consume_is_one_time() {
         let reg = TokenRegistry::new();
-        reg.register("tok-2".to_string(), "task-002".to_string())
+        reg.register("tok-2".to_string(), "task-002".to_string(), AgentRole::User)
             .await;
         assert!(reg.consume("tok-2").await.is_some());
         assert!(reg.consume("tok-2").await.is_none());
@@ -122,18 +166,30 @@ mod tests {
     #[tokio::test]
     async fn resolve_after_handshake() {
         let reg = TokenRegistry::new();
-        reg.register("tok-3".to_string(), "task-003".to_string())
+        reg.register("tok-3".to_string(), "task-003".to_string(), AgentRole::Admin)
             .await;
         let (key, _) = reg.consume("tok-3").await.unwrap();
-        assert_eq!(reg.resolve(&key).await, Some("task-003".to_string()));
+        let info = reg.resolve_info(&key).await.unwrap();
+        assert_eq!(info.task_id, "task-003");
+        assert!(info.role.is_admin());
     }
 
     #[tokio::test]
     async fn revoke_pending_token() {
         let reg = TokenRegistry::new();
-        reg.register("tok-4".to_string(), "task-004".to_string())
+        reg.register("tok-4".to_string(), "task-004".to_string(), AgentRole::User)
             .await;
         reg.revoke("tok-4").await;
         assert!(reg.consume("tok-4").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn user_role_default() {
+        let reg = TokenRegistry::new();
+        reg.register("tok-5".to_string(), "task-005".to_string(), AgentRole::User)
+            .await;
+        let (key, _) = reg.consume("tok-5").await.unwrap();
+        let info = reg.resolve_info(&key).await.unwrap();
+        assert!(!info.role.is_admin());
     }
 }

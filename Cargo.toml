@@ -3,6 +3,8 @@ resolver = "3"
 members = [
     "crates/logos-vfs",
     "crates/logos-mm",
+    "crates/logos-session",
     "crates/logos-system",
     "crates/logos-kernel",
+    "crates/logos-mcp",
 ]

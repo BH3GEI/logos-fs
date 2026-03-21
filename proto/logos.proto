@@ -8,7 +8,8 @@ package logos.kernel.v1;
 // Turn terminator:  Complete.
 //
 // All data access goes through Read/Write/Patch with a logos:// URI.
-// Exec and Call are reserved for sandbox and proc namespaces (not yet implemented).
+// Exec runs shell commands in sandbox containers with URI translation.
+// Call dispatches to proc tools (built-in or external git projects).
 // Complete is the mandatory final call of every agent turn.
 
 service Logos {
@@ -37,7 +38,7 @@ message WriteRes {}
 message PatchReq { string uri = 1; string partial = 2; }
 message PatchRes {}
 
-// --- Exec: sandbox shell execution (not yet implemented) ---
+// --- Exec: sandbox + services shell execution ---
 
 message ExecReq { string command = 1; }
 message ExecRes {
@@ -46,7 +47,7 @@ message ExecRes {
   int32 exit_code = 3;
 }
 
-// --- Call: proc tool invocation (not yet implemented) ---
+// --- Call: proc tool invocation ---
 
 message CallReq { string tool = 1; string params_json = 2; }
 message CallRes { string result_json = 1; }
@@ -74,7 +75,7 @@ message CompleteRes {
 message HandshakeReq { string token = 1; }
 message HandshakeRes { bool ok = 1; string error = 2; }
 
-message RegisterTokenReq { string token = 1; string task_id = 2; }
+message RegisterTokenReq { string token = 1; string task_id = 2; string role = 3; }
 message RegisterTokenRes {}
 
 message RevokeTokenReq { string token = 1; }

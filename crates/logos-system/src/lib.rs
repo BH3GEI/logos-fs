@@ -1,12 +1,13 @@
 pub mod anchors;
 pub mod complete;
+pub mod search;
 pub mod tasks;
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use async_trait::async_trait;
 use logos_vfs::{Namespace, VfsError};
+use sqlx::sqlite::SqlitePoolOptions;
 
 use anchors::AnchorDb;
 use tasks::TaskDb;
@@ -26,17 +27,36 @@ pub struct SystemModule {
 }
 
 impl SystemModule {
-    pub fn init(db_path: PathBuf) -> Result<Self, VfsError> {
+    pub async fn init(db_path: PathBuf) -> Result<Self, VfsError> {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| VfsError::Io(format!("create system dir: {e}")))?;
         }
-        let conn = rusqlite::Connection::open(&db_path)
+        let url = format!("sqlite:{}?mode=rwc", db_path.display());
+        let pool = SqlitePoolOptions::new()
+            .max_connections(4)
+            .connect(&url)
+            .await
             .map_err(|e| VfsError::Sqlite(format!("open system db: {e}")))?;
-        let conn = Arc::new(std::sync::Mutex::new(conn));
-        let tasks = TaskDb::new(Arc::clone(&conn))?;
-        let anchors = AnchorDb::new(conn)?;
+
+        let tasks = TaskDb::new(pool.clone()).await?;
+        let anchors = AnchorDb::new(pool).await?;
         Ok(Self { tasks, anchors })
+    }
+
+    /// Create a task programmatically (used by cron scheduler).
+    pub async fn create_task(&self, content: &str) -> Result<(), VfsError> {
+        self.tasks.create(content).await
+    }
+
+    /// Transition a task's status (used by runtime for task lifecycle).
+    pub async fn transition_task(&self, task_id: &str, new_status: &str) -> Result<(), VfsError> {
+        tasks::TaskDb::transition_status(&self.tasks.pool, task_id, new_status).await
+    }
+
+    /// Search tasks and anchors — RFC 003 §6.2 multi-level experience retrieval.
+    pub async fn search_tasks(&self, query: &str, limit: i64) -> Result<String, VfsError> {
+        search::search_tasks(&self.tasks.pool, query, limit).await
     }
 
     /// Execute logos_complete. Called by the gRPC layer directly, not through Namespace trait.
@@ -126,5 +146,130 @@ impl Namespace for SystemModule {
         }
 
         self.write(path, partial).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use logos_vfs::Namespace;
+
+    async fn test_system() -> (SystemModule, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let sys = SystemModule::init(dir.path().join("test.db")).await.unwrap();
+        (sys, dir)
+    }
+
+    #[tokio::test]
+    async fn task_create_and_get() {
+        let (sys, _dir) = test_system().await;
+        sys.write(&["tasks"], r#"{"task_id":"t-1","description":"test task","chat_id":"c-1"}"#)
+            .await.unwrap();
+
+        let result = sys.read(&["tasks", "t-1"]).await.unwrap();
+        let val: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(val["task_id"], "t-1");
+        assert_eq!(val["status"], "pending");
+    }
+
+    #[tokio::test]
+    async fn task_lifecycle() {
+        let (sys, _dir) = test_system().await;
+        sys.write(&["tasks"], r#"{"task_id":"t-2","description":"lifecycle","chat_id":"c-1"}"#)
+            .await.unwrap();
+
+        // pending → active
+        tasks::TaskDb::transition_status(&sys.tasks.pool, "t-2", "active").await.unwrap();
+        let result = sys.read(&["tasks", "t-2"]).await.unwrap();
+        assert!(result.contains("\"active\""));
+
+        // active → sleep
+        tasks::TaskDb::transition_status(&sys.tasks.pool, "t-2", "sleep").await.unwrap();
+        let result = sys.read(&["tasks", "t-2"]).await.unwrap();
+        assert!(result.contains("\"sleep\""));
+
+        // sleep → active
+        tasks::TaskDb::transition_status(&sys.tasks.pool, "t-2", "active").await.unwrap();
+
+        // active → finished
+        tasks::TaskDb::transition_status(&sys.tasks.pool, "t-2", "finished").await.unwrap();
+        let result = sys.read(&["tasks", "t-2"]).await.unwrap();
+        assert!(result.contains("\"finished\""));
+    }
+
+    #[tokio::test]
+    async fn task_list_hides_pending() {
+        let (sys, _dir) = test_system().await;
+        sys.write(&["tasks"], r#"{"task_id":"t-3","description":"pending","chat_id":"c-1"}"#)
+            .await.unwrap();
+        sys.write(&["tasks"], r#"{"task_id":"t-4","description":"active","chat_id":"c-1"}"#)
+            .await.unwrap();
+        tasks::TaskDb::transition_status(&sys.tasks.pool, "t-4", "active").await.unwrap();
+
+        let result = sys.read(&["tasks"]).await.unwrap();
+        assert!(!result.contains("t-3")); // pending hidden
+        assert!(result.contains("t-4")); // active visible
+    }
+
+    #[tokio::test]
+    async fn anchor_create_and_list() {
+        let (sys, _dir) = test_system().await;
+        sys.write(&["tasks"], r#"{"task_id":"t-5","description":"anchor test","chat_id":"c-1"}"#)
+            .await.unwrap();
+        tasks::TaskDb::transition_status(&sys.tasks.pool, "t-5", "active").await.unwrap();
+
+        // Create anchor via complete
+        let params = complete::CompleteParams {
+            task_id: "t-5".to_string(),
+            summary: "test anchor".to_string(),
+            reply: String::new(),
+            anchor: true,
+            anchor_facts: r#"[{"type":"decision","topic":"test","value":"yes"}]"#.to_string(),
+            task_log: String::new(),
+            sleep_reason: String::new(),
+            sleep_retry: false,
+            resume_task_id: String::new(),
+        };
+        let result = sys.complete(params).await.unwrap();
+        assert!(!result.anchor_id.is_empty());
+
+        // List anchors
+        let anchors = sys.read(&["anchors", "t-5"]).await.unwrap();
+        assert!(anchors.contains("test anchor"));
+    }
+
+    #[tokio::test]
+    async fn anchor_search_bm25() {
+        let (sys, _dir) = test_system().await;
+        sys.write(&["tasks"], r#"{"task_id":"t-6","description":"search test","chat_id":"c-1"}"#)
+            .await.unwrap();
+        tasks::TaskDb::transition_status(&sys.tasks.pool, "t-6", "active").await.unwrap();
+
+        let params = complete::CompleteParams {
+            task_id: "t-6".to_string(),
+            summary: "npm dependency resolution".to_string(),
+            reply: String::new(),
+            anchor: true,
+            anchor_facts: r#"[{"type":"troubleshooting","symptom_snippet":"ERESOLVE unable to resolve dependency tree","solution":"npm install --legacy-peer-deps"}]"#.to_string(),
+            task_log: String::new(),
+            sleep_reason: String::new(),
+            sleep_retry: false,
+            resume_task_id: String::new(),
+        };
+        sys.complete(params).await.unwrap();
+
+        let result = sys.search_tasks("ERESOLVE", 10).await.unwrap();
+        assert!(result.contains("ERESOLVE"));
+    }
+
+    #[tokio::test]
+    async fn invalid_transition_rejected() {
+        let (sys, _dir) = test_system().await;
+        sys.write(&["tasks"], r#"{"task_id":"t-7","description":"invalid","chat_id":"c-1"}"#)
+            .await.unwrap();
+
+        // pending → finished is not a valid transition
+        let result = tasks::TaskDb::transition_status(&sys.tasks.pool, "t-7", "finished").await;
+        assert!(result.is_err());
     }
 }

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::middleware::VfsMiddleware;
 use crate::namespace::Namespace;
 use crate::uri;
 use crate::VfsError;
@@ -9,8 +10,11 @@ use crate::VfsError;
 ///
 /// Subsystems `mount` during boot. Once all required subsystems are in place,
 /// `open` is called and the table starts accepting requests.
+///
+/// Middleware hooks run before/after operations (RFC 002 §12.6).
 pub struct RoutingTable {
     namespaces: HashMap<String, Box<dyn Namespace>>,
+    middlewares: Vec<Box<dyn VfsMiddleware>>,
     open: AtomicBool,
 }
 
@@ -18,6 +22,7 @@ impl RoutingTable {
     pub fn new() -> Self {
         Self {
             namespaces: HashMap::new(),
+            middlewares: Vec::new(),
             open: AtomicBool::new(false),
         }
     }
@@ -26,6 +31,11 @@ impl RoutingTable {
     pub fn mount(&mut self, ns: Box<dyn Namespace>) {
         let name = ns.name().to_string();
         self.namespaces.insert(name, ns);
+    }
+
+    /// Add a middleware to the chain. Called during boot.
+    pub fn add_middleware(&mut self, mw: Box<dyn VfsMiddleware>) {
+        self.middlewares.push(mw);
     }
 
     /// Mark the routing table as open. After this, requests are accepted.
@@ -43,21 +53,45 @@ impl RoutingTable {
     }
 
     pub async fn read(&self, raw_uri: &str) -> Result<String, VfsError> {
+        for mw in &self.middlewares {
+            mw.before_read(raw_uri).await?;
+        }
         let (ns, uri) = self.resolve(raw_uri)?;
         let path_refs: Vec<&str> = uri.path.iter().copied().collect();
-        ns.read(&path_refs).await
+        let result = ns.read(&path_refs).await;
+        let success = result.is_ok();
+        for mw in &self.middlewares {
+            mw.after_op("read", raw_uri, success).await;
+        }
+        result
     }
 
     pub async fn write(&self, raw_uri: &str, content: &str) -> Result<(), VfsError> {
+        for mw in &self.middlewares {
+            mw.before_write(raw_uri, content).await?;
+        }
         let (ns, uri) = self.resolve(raw_uri)?;
         let path_refs: Vec<&str> = uri.path.iter().copied().collect();
-        ns.write(&path_refs, content).await
+        let result = ns.write(&path_refs, content).await;
+        let success = result.is_ok();
+        for mw in &self.middlewares {
+            mw.after_op("write", raw_uri, success).await;
+        }
+        result
     }
 
     pub async fn patch(&self, raw_uri: &str, partial: &str) -> Result<(), VfsError> {
+        for mw in &self.middlewares {
+            mw.before_patch(raw_uri, partial).await?;
+        }
         let (ns, uri) = self.resolve(raw_uri)?;
         let path_refs: Vec<&str> = uri.path.iter().copied().collect();
-        ns.patch(&path_refs, partial).await
+        let result = ns.patch(&path_refs, partial).await;
+        let success = result.is_ok();
+        for mw in &self.middlewares {
+            mw.after_op("patch", raw_uri, success).await;
+        }
+        result
     }
 
     fn resolve<'a>(&'a self, raw_uri: &'a str) -> Result<(&'a dyn Namespace, uri::LogosUri<'a>), VfsError> {

@@ -1,7 +1,9 @@
+pub mod middleware;
 pub mod namespace;
 pub mod table;
 pub mod uri;
 
+pub use middleware::{JsonValidator, VfsMiddleware};
 pub use namespace::Namespace;
 pub use table::RoutingTable;
 

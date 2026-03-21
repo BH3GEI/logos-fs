@@ -1,31 +1,87 @@
 mod messages;
 mod summaries;
+pub mod views;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use logos_vfs::{Namespace, VfsError};
 
 use messages::MessageDb;
 use summaries::SummaryDb;
+use views::MemoryView;
+
+pub use logos_session::SessionStore;
 
 /// The Memory Module — handles `logos://memory/`.
 ///
-/// URI routing:
-///   logos://memory/groups/{gid}/messages/{msg_id}                          → read single message
-///   logos://memory/groups/{gid}/messages                                   → write (insert) message
-///   logos://memory/groups/{gid}/messages/search/{query}[/{limit}]          → FTS search
-///   logos://memory/groups/{gid}/messages/range/{ranges}[/{limit}[/{offset}]] → range fetch
-///   logos://memory/groups/{gid}/summary/{layer}/latest                     → read latest summary
-///   logos://memory/groups/{gid}/summary/{layer}/{period}                   → read/write summary
+/// Path-mapped reads (RFC 003 §3.1):
+///   logos://memory/groups/{gid}/messages/{msg_id}           → single message
+///   logos://memory/groups/{gid}/summary/{layer}/latest      → latest summary
+///   logos://memory/groups/{gid}/summary/{layer}/{period}    → summary by period
+///
+/// Path-mapped writes:
+///   logos://memory/groups/{gid}/messages                    → insert message (JSON)
+///   logos://memory/groups/{gid}/summary/{layer}/{period}    → insert summary (JSON)
+///
+/// Complex queries go through logos_call (proc tools) — RFC 003 §3.2:
+///   call("memory.search",      { chat_id, query, limit })
+///   call("memory.range_fetch", { chat_id, ranges, limit, offset })
 pub struct MemoryModule {
     messages: MessageDb,
+    sessions: Arc<SessionStore>,
+    views: HashMap<String, Box<dyn views::MemoryView>>,
 }
 
 impl MemoryModule {
-    pub fn init(db_root: PathBuf) -> Result<Self, VfsError> {
+    pub fn init(db_root: PathBuf, sessions: Arc<SessionStore>) -> Result<Self, VfsError> {
         let messages = MessageDb::new(db_root)?;
-        Ok(Self { messages })
+        let mut view_map: HashMap<String, Box<dyn views::MemoryView>> = HashMap::new();
+        let by_speaker = views::BySpeakerView;
+        view_map.insert(by_speaker.name().to_string(), Box::new(by_speaker));
+        let recent = views::RecentView;
+        view_map.insert(recent.name().to_string(), Box::new(recent));
+        Ok(Self {
+            messages,
+            sessions,
+            views: view_map,
+        })
+    }
+
+    /// Access the session store (for runtime context injection — RFC 003 §5.5).
+    pub fn sessions(&self) -> &Arc<SessionStore> {
+        &self.sessions
+    }
+
+    // --- call handlers (proc tools) ---
+
+    /// Dispatch a logos_call to the appropriate handler.
+    pub async fn handle_call(&self, tool: &str, params: &str) -> Result<String, VfsError> {
+        let val: serde_json::Value =
+            serde_json::from_str(params).map_err(|e| VfsError::InvalidJson(e.to_string()))?;
+        let chat_id = val["chat_id"].as_str().unwrap_or_default();
+
+        match tool {
+            "memory.search" => {
+                let query = val["query"].as_str().unwrap_or_default();
+                let limit = val["limit"].as_i64().unwrap_or(10);
+                self.messages.search_fts(chat_id, query, limit).await
+            }
+            "memory.range_fetch" => {
+                self.messages.range_fetch(chat_id, params).await
+            }
+            _ if tool.starts_with("memory.view.") => {
+                let view_name = tool.strip_prefix("memory.view.").unwrap_or("");
+                let view = self.views.get(view_name).ok_or_else(|| {
+                    VfsError::NotFound(format!("unknown view: {view_name}"))
+                })?;
+                let pool = self.messages.pool(chat_id).await?;
+                view.query(&pool, chat_id, params).await
+            }
+            _ => Err(VfsError::NotFound(format!("unknown memory tool: {tool}"))),
+        }
     }
 }
 
@@ -36,7 +92,6 @@ impl Namespace for MemoryModule {
     }
 
     async fn read(&self, path: &[&str]) -> Result<String, VfsError> {
-        // path: ["groups", gid, resource, ...]
         if path.len() < 3 || path[0] != "groups" {
             return Err(VfsError::InvalidPath(
                 "expected logos://memory/groups/{gid}/...".to_string(),
@@ -47,56 +102,40 @@ impl Namespace for MemoryModule {
 
         match resource {
             "messages" => {
-                if let Some(sub) = path.get(3) {
-                    if *sub == "search" {
-                        let query = path.get(4).unwrap_or(&"");
-                        let limit: i64 = path.get(5).and_then(|s| s.parse().ok()).unwrap_or(10);
-                        return self.messages.search_fts(gid, query, limit).await;
-                    }
-                    if *sub == "range" {
-                        let range_str = path.get(4).unwrap_or(&"");
-                        let limit: i64 = path.get(5).and_then(|s| s.parse().ok()).unwrap_or(50);
-                        let offset: i64 = path.get(6).and_then(|s| s.parse().ok()).unwrap_or(0);
-                        let ranges: Vec<Vec<i64>> = range_str
-                            .split(',')
-                            .filter_map(|r| {
-                                let parts: Vec<&str> = r.split('-').collect();
-                                if parts.len() == 2 {
-                                    Some(vec![parts[0].parse().ok()?, parts[1].parse().ok()?])
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect();
-                        let params = serde_json::json!({
-                            "ranges": ranges, "limit": limit, "offset": offset
-                        });
-                        return self.messages.range_fetch(gid, &params.to_string()).await;
-                    }
-                    let msg_id: i64 = sub
-                        .parse()
-                        .map_err(|_| VfsError::InvalidPath(format!("invalid msg_id: {sub}")))?;
-                    return self
-                        .messages
-                        .get_by_id(gid, msg_id)
-                        .await
-                        .map(|opt| opt.unwrap_or_else(|| "null".to_string()));
-                }
-                Err(VfsError::InvalidPath("missing msg_id or sub-resource".to_string()))
+                let msg_id_str = path.get(3).ok_or_else(|| {
+                    VfsError::InvalidPath("expected logos://memory/groups/{gid}/messages/{msg_id}".to_string())
+                })?;
+                let msg_id: i64 = msg_id_str
+                    .parse()
+                    .map_err(|_| VfsError::InvalidPath(format!("invalid msg_id: {msg_id_str}")))?;
+                self.messages
+                    .get_by_id(gid, msg_id)
+                    .await
+                    .map(|opt| opt.unwrap_or_else(|| "null".to_string()))
             }
             "summary" => {
                 let layer = path.get(3).ok_or_else(|| {
                     VfsError::InvalidPath("missing summary layer".to_string())
                 })?;
                 let period = path.get(4).copied().unwrap_or("latest");
-                let conn = self.messages.conn(gid).await?;
-                {
-                    let guard = conn.lock().map_err(|e| VfsError::Sqlite(e.to_string()))?;
-                    SummaryDb::ensure_schema(&guard)?;
-                }
-                SummaryDb::read(conn, gid, layer, period)
+                let pool = self.messages.pool(gid).await?;
+                SummaryDb::ensure_schema(&pool).await?;
+                SummaryDb::read(pool, gid, layer, period)
                     .await
                     .map(|opt| opt.unwrap_or_else(|| "null".to_string()))
+            }
+            // logos://memory/groups/{gid}/views/{view_name}
+            "views" => {
+                let view_name = path.get(3).ok_or_else(|| {
+                    VfsError::InvalidPath("missing view name".to_string())
+                })?;
+                let view = self.views.get(*view_name).ok_or_else(|| {
+                    VfsError::NotFound(format!("unknown view: {view_name}"))
+                })?;
+                // Remaining path segments joined as params JSON (or empty)
+                let params = path.get(4).copied().unwrap_or("{}");
+                let pool = self.messages.pool(gid).await?;
+                view.query(&pool, gid, params).await
             }
             _ => Err(VfsError::InvalidPath(format!(
                 "unknown memory resource: {resource}"
@@ -114,19 +153,33 @@ impl Namespace for MemoryModule {
         let resource = path[2];
 
         match resource {
-            "messages" => self.messages.insert(gid, content).await,
+            "messages" => {
+                let msg_id = self.messages.insert(gid, content).await?;
+
+                // Update session topology (RFC 003 §5.1)
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(content) {
+                    let msg_ref = logos_session::MsgRef {
+                        msg_id,
+                        chat_id: gid.to_string(),
+                        reply_to: val["reply_to"].as_i64(),
+                        text: val["text"].as_str().unwrap_or_default().to_string(),
+                        speaker: val["speaker"].as_str().unwrap_or_default().to_string(),
+                        ts: val["ts"].as_str().unwrap_or_default().to_string(),
+                    };
+                    self.sessions.observe(msg_ref).await;
+                }
+
+                Ok(())
+            }
             "summary" => {
                 if path.len() < 5 {
                     return Err(VfsError::InvalidPath(
                         "expected logos://memory/groups/{gid}/summary/{layer}/{period}".to_string(),
                     ));
                 }
-                let conn = self.messages.conn(gid).await?;
-                {
-                    let guard = conn.lock().map_err(|e| VfsError::Sqlite(e.to_string()))?;
-                    SummaryDb::ensure_schema(&guard)?;
-                }
-                SummaryDb::write(conn, gid, content).await
+                let pool = self.messages.pool(gid).await?;
+                SummaryDb::ensure_schema(&pool).await?;
+                SummaryDb::write(pool, gid, content).await
             }
             _ => Err(VfsError::InvalidPath(format!(
                 "unknown memory resource for write: {resource}"
@@ -135,6 +188,124 @@ impl Namespace for MemoryModule {
     }
 
     async fn patch(&self, path: &[&str], partial: &str) -> Result<(), VfsError> {
+        // For summary resources: read-merge-write with deep merge.
+        // For messages: patch is not meaningful (append-only), fall through to write.
+        if path.len() >= 3 && path[2] == "summary" {
+            let existing = self.read(path).await.unwrap_or_else(|_| "null".to_string());
+            if let (Ok(mut base), Ok(patch_val)) = (
+                serde_json::from_str::<serde_json::Value>(&existing),
+                serde_json::from_str::<serde_json::Value>(partial),
+            ) {
+                if !base.is_null() {
+                    logos_vfs::json_deep_merge(&mut base, &patch_val);
+                    let merged = serde_json::to_string(&base)
+                        .unwrap_or_else(|_| partial.to_string());
+                    return self.write(path, &merged).await;
+                }
+            }
+        }
         self.write(path, partial).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use logos_vfs::Namespace;
+
+    async fn test_mm() -> (MemoryModule, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = Arc::new(SessionStore::new(10, 10));
+        let mm = MemoryModule::init(dir.path().to_path_buf(), sessions).unwrap();
+        (mm, dir)
+    }
+
+    #[tokio::test]
+    async fn insert_and_get_message() {
+        let (mm, _dir) = test_mm().await;
+        let msg = r#"{"ts":"2026-03-20T10:00:00Z","speaker":"alice","text":"hello","reply_to":null}"#;
+        mm.write(&["groups", "chat-1", "messages"], msg).await.unwrap();
+
+        let result = mm.read(&["groups", "chat-1", "messages", "1"]).await.unwrap();
+        let val: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(val["speaker"], "alice");
+        assert_eq!(val["text"], "hello");
+    }
+
+    #[tokio::test]
+    async fn search_fts() {
+        let (mm, _dir) = test_mm().await;
+        mm.write(&["groups", "chat-1", "messages"],
+            r#"{"ts":"2026-03-20T10:00:00Z","speaker":"bob","text":"rust is great"}"#
+        ).await.unwrap();
+        mm.write(&["groups", "chat-1", "messages"],
+            r#"{"ts":"2026-03-20T10:01:00Z","speaker":"alice","text":"python is nice"}"#
+        ).await.unwrap();
+
+        let result = mm.handle_call("memory.search",
+            r#"{"chat_id":"chat-1","query":"rust","limit":10}"#
+        ).await.unwrap();
+        assert!(result.contains("rust is great"));
+        assert!(!result.contains("python"));
+    }
+
+    #[tokio::test]
+    async fn range_fetch() {
+        let (mm, _dir) = test_mm().await;
+        for i in 0..5 {
+            mm.write(&["groups", "chat-1", "messages"],
+                &format!(r#"{{"ts":"2026-03-20T10:{i:02}:00Z","speaker":"user","text":"msg {i}"}}"#)
+            ).await.unwrap();
+        }
+
+        let result = mm.handle_call("memory.range_fetch",
+            r#"{"chat_id":"chat-1","ranges":[[2,4]],"limit":10}"#
+        ).await.unwrap();
+        let arr: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+        assert_eq!(arr.len(), 3); // msg_id 2,3,4
+    }
+
+    #[tokio::test]
+    async fn summary_write_and_read() {
+        let (mm, _dir) = test_mm().await;
+        let summary = r#"{"layer":"short","period_start":"2026-03-20T10","period_end":"2026-03-20T10","source_refs":"[[1,5]]","content":"test summary"}"#;
+        mm.write(&["groups", "chat-1", "summary", "short", "2026-03-20T10"], summary)
+            .await.unwrap();
+
+        let result = mm.read(&["groups", "chat-1", "summary", "short", "latest"]).await.unwrap();
+        assert!(result.contains("test summary"));
+    }
+
+    #[tokio::test]
+    async fn view_recent() {
+        let (mm, _dir) = test_mm().await;
+        for i in 0..3 {
+            mm.write(&["groups", "chat-1", "messages"],
+                &format!(r#"{{"ts":"2026-03-20T10:{i:02}:00Z","speaker":"user","text":"msg {i}"}}"#)
+            ).await.unwrap();
+        }
+
+        let result = mm.handle_call("memory.view.recent",
+            r#"{"chat_id":"chat-1","limit":2}"#
+        ).await.unwrap();
+        let arr: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+        assert_eq!(arr.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn view_by_speaker() {
+        let (mm, _dir) = test_mm().await;
+        mm.write(&["groups", "chat-1", "messages"],
+            r#"{"ts":"2026-03-20T10:00:00Z","speaker":"alice","text":"hello from alice"}"#
+        ).await.unwrap();
+        mm.write(&["groups", "chat-1", "messages"],
+            r#"{"ts":"2026-03-20T10:01:00Z","speaker":"bob","text":"hello from bob"}"#
+        ).await.unwrap();
+
+        let result = mm.handle_call("memory.view.by_speaker",
+            r#"{"chat_id":"chat-1","speaker":"alice","limit":10}"#
+        ).await.unwrap();
+        assert!(result.contains("alice"));
+        assert!(!result.contains("bob"));
     }
 }
