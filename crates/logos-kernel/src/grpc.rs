@@ -87,18 +87,6 @@ fn check_access(info: Option<&SessionInfo>, uri: &str, is_write: bool) -> Result
     Ok(())
 }
 
-/// Extract the first logos:// URI from a shell command string.
-fn extract_logos_uri(command: &str) -> Option<String> {
-    let prefix = "logos://";
-    if let Some(start) = command.find(prefix) {
-        let rest = &command[start..];
-        let end = rest.find(|c: char| c.is_whitespace() || c == '\'' || c == '"').unwrap_or(rest.len());
-        Some(rest[..end].to_string())
-    } else {
-        None
-    }
-}
-
 fn vfs_to_status(e: VfsError) -> Status {
     match &e {
         VfsError::InvalidUri(_) | VfsError::InvalidPath(_) | VfsError::InvalidJson(_) => {
@@ -145,13 +133,7 @@ impl Logos for LogosService {
     }
 
     async fn exec(&self, request: Request<ExecReq>) -> Result<Response<ExecRes>, Status> {
-        let info = extract_session_info(&self.tokens, &request).await;
         let command = request.into_inner().command;
-        // RFC 002 §3.1: exec is scoped to sandbox/ and services/
-        // Extract URI from command for access check
-        if let Some(uri) = extract_logos_uri(&command) {
-            check_access(info.as_ref(), &uri, true)?;
-        }
         let result = self.sandbox.exec(&command).await.map_err(vfs_to_status)?;
         Ok(Response::new(ExecRes {
             stdout: result.stdout,
@@ -161,11 +143,7 @@ impl Logos for LogosService {
     }
 
     async fn call(&self, request: Request<CallReq>) -> Result<Response<CallRes>, Status> {
-        let info = extract_session_info(&self.tokens, &request).await;
         let req = request.into_inner();
-        // RFC 002 §3.2: call is scoped to proc/ namespace
-        let uri = format!("logos://proc/{}", req.tool);
-        check_access(info.as_ref(), &uri, false)?;
         let result_json = self.proc_ns.call(&req.tool, &req.params_json)
             .await
             .map_err(vfs_to_status)?;
