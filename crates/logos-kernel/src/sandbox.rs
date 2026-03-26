@@ -22,8 +22,8 @@ pub struct ExecResult {
 
 /// Sandbox namespace — `logos://sandbox/`.
 ///
-/// Each task gets a Docker container with `host_root/{task_id}/` bind-mounted
-/// to `/workspace` inside the container.
+/// Each agent config gets a Docker container with `host_root/{agent_id}/` bind-mounted
+/// to `/workspace` inside the container. Multiple tasks from the same agent share one container.
 ///
 /// - **read/write/patch**: operate on the host filesystem directly (via bind mount)
 /// - **exec**: runs commands inside the container via `docker exec`
@@ -31,7 +31,7 @@ pub struct SandboxNs {
     docker: Docker,
     host_root: PathBuf,
     image: String,
-    containers: Mutex<HashMap<String, String>>, // task_id → container_id
+    containers: Mutex<HashMap<String, String>>, // agent_id → container_id
 }
 
 impl SandboxNs {
@@ -61,22 +61,22 @@ impl SandboxNs {
         })
     }
 
-    /// Ensure a container exists and is running for the given task_id.
-    async fn ensure_container(&self, task_id: &str) -> Result<String, VfsError> {
+    /// Ensure a container exists and is running for the given agent_id.
+    async fn ensure_container(&self, agent_id: &str) -> Result<String, VfsError> {
         {
             let containers = self.containers.lock().await;
-            if let Some(id) = containers.get(task_id) {
+            if let Some(id) = containers.get(agent_id) {
                 return Ok(id.clone());
             }
         }
 
-        // Create host directory for this task
-        let task_dir = self.host_root.join(task_id);
-        tokio::fs::create_dir_all(&task_dir)
+        // Create host directory for this agent
+        let agent_dir = self.host_root.join(agent_id);
+        tokio::fs::create_dir_all(&agent_dir)
             .await
-            .map_err(|e| VfsError::Io(format!("create task dir: {e}")))?;
+            .map_err(|e| VfsError::Io(format!("create agent dir: {e}")))?;
 
-        let container_name = format!("logos-sandbox-{task_id}");
+        let container_name = format!("logos-sandbox-{agent_id}");
 
         // Check if container already exists (e.g. from previous run)
         #[allow(deprecated)]
@@ -98,9 +98,9 @@ impl SandboxNs {
                 id
             }
             Err(_) => {
-                let host_path = task_dir
+                let host_path = agent_dir
                     .canonicalize()
-                    .unwrap_or(task_dir.clone())
+                    .unwrap_or(agent_dir.clone())
                     .to_string_lossy()
                     .to_string();
 
@@ -149,7 +149,7 @@ impl SandboxNs {
         };
 
         let mut containers = self.containers.lock().await;
-        containers.insert(task_id.to_string(), container_id.clone());
+        containers.insert(agent_id.to_string(), container_id.clone());
         Ok(container_id)
     }
 
@@ -179,15 +179,15 @@ impl SandboxNs {
         None
     }
 
-    /// Execute a shell command inside the task's container.
+    /// Execute a shell command inside the agent's container.
     ///
     /// Translates `logos://sandbox/{task_id}/...` → `/workspace/...` in the command.
-    pub async fn exec(&self, command: &str) -> Result<ExecResult, VfsError> {
-        // Determine task_id from the command or use a default
-        let task_id = Self::extract_task_id(command)
-            .unwrap_or_else(|| "__default__".to_string());
+    pub async fn exec(&self, command: &str, agent_id: &str) -> Result<ExecResult, VfsError> {
+        let container_id = self.ensure_container(agent_id).await?;
 
-        let container_id = self.ensure_container(&task_id).await?;
+        // Extract task_id from command for URI translation only
+        let task_id = Self::extract_task_id(command)
+            .unwrap_or_else(|| agent_id.to_string());
 
         // Translate URIs: logos://sandbox/{task_id}/... → /workspace/...
         let translated = command.replace(
@@ -426,7 +426,7 @@ mod tests {
         let container_id = sandbox.ensure_container("test-exec").await.unwrap();
         assert!(!container_id.is_empty());
 
-        let result = sandbox.exec("echo 'hello from sandbox'").await.unwrap();
+        let result = sandbox.exec("echo 'hello from sandbox'", "test-exec").await.unwrap();
         assert_eq!(result.exit_code, 0);
         assert!(result.stdout.contains("hello from sandbox"));
 
@@ -447,7 +447,7 @@ mod tests {
 
         // Exec cat inside container — should see the file via bind mount
         let result = sandbox
-            .exec("cat logos://sandbox/test-vis/hello.txt")
+            .exec("cat logos://sandbox/test-vis/hello.txt", "test-vis")
             .await
             .unwrap();
         assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
@@ -464,7 +464,7 @@ mod tests {
         sandbox.write(&["test-uri", "data.txt"], "translated!").await.unwrap();
 
         let result = sandbox
-            .exec("cat logos://sandbox/test-uri/data.txt")
+            .exec("cat logos://sandbox/test-uri/data.txt", "test-uri")
             .await
             .unwrap();
         assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);

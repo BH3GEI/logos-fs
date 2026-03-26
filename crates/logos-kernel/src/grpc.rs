@@ -133,8 +133,10 @@ impl Logos for LogosService {
     }
 
     async fn exec(&self, request: Request<ExecReq>) -> Result<Response<ExecRes>, Status> {
+        let info = extract_session_info(&self.tokens, &request).await;
+        let agent_id = info.map(|i| i.agent_id).unwrap_or_else(|| "__default__".to_string());
         let command = request.into_inner().command;
-        let result = self.sandbox.exec(&command).await.map_err(vfs_to_status)?;
+        let result = self.sandbox.exec(&command, &agent_id).await.map_err(vfs_to_status)?;
         Ok(Response::new(ExecRes {
             stdout: result.stdout,
             stderr: result.stderr,
