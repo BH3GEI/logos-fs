@@ -8,9 +8,9 @@ pub mod proc;
 mod proc_store;
 mod sandbox;
 mod services;
-mod tmp;
+pub mod tmp;
 mod token;
-mod users;
+pub mod users;
 
 use std::path::PathBuf;
 use std::sync::Arc;

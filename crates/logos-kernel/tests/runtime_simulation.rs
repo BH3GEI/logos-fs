@@ -8,6 +8,26 @@ use std::sync::Arc;
 
 use logos_vfs::{Namespace, RoutingTable};
 
+// --- Namespace wrappers for Arc sharing ---
+
+struct MmRef(Arc<logos_mm::MemoryModule>);
+#[async_trait::async_trait]
+impl Namespace for MmRef {
+    fn name(&self) -> &str { "memory" }
+    async fn read(&self, p: &[&str]) -> Result<String, logos_vfs::VfsError> { self.0.read(p).await }
+    async fn write(&self, p: &[&str], c: &str) -> Result<(), logos_vfs::VfsError> { self.0.write(p, c).await }
+    async fn patch(&self, p: &[&str], c: &str) -> Result<(), logos_vfs::VfsError> { self.0.patch(p, c).await }
+}
+
+struct SysRef(Arc<logos_system::SystemModule>);
+#[async_trait::async_trait]
+impl Namespace for SysRef {
+    fn name(&self) -> &str { "system" }
+    async fn read(&self, p: &[&str]) -> Result<String, logos_vfs::VfsError> { self.0.read(p).await }
+    async fn write(&self, p: &[&str], c: &str) -> Result<(), logos_vfs::VfsError> { self.0.write(p, c).await }
+    async fn patch(&self, p: &[&str], c: &str) -> Result<(), logos_vfs::VfsError> { self.0.patch(p, c).await }
+}
+
 /// Boot a minimal kernel with all namespaces, return shared references.
 async fn boot_kernel() -> (
     Arc<RoutingTable>,
@@ -33,24 +53,6 @@ async fn boot_kernel() -> (
         .await
         .unwrap();
     let system_arc = Arc::new(system);
-
-    // Mount via wrappers
-    struct MmRef(Arc<logos_mm::MemoryModule>);
-    #[async_trait::async_trait]
-    impl Namespace for MmRef {
-        fn name(&self) -> &str { "memory" }
-        async fn read(&self, p: &[&str]) -> Result<String, logos_vfs::VfsError> { self.0.read(p).await }
-        async fn write(&self, p: &[&str], c: &str) -> Result<(), logos_vfs::VfsError> { self.0.write(p, c).await }
-        async fn patch(&self, p: &[&str], c: &str) -> Result<(), logos_vfs::VfsError> { self.0.patch(p, c).await }
-    }
-    struct SysRef(Arc<logos_system::SystemModule>);
-    #[async_trait::async_trait]
-    impl Namespace for SysRef {
-        fn name(&self) -> &str { "system" }
-        async fn read(&self, p: &[&str]) -> Result<String, logos_vfs::VfsError> { self.0.read(p).await }
-        async fn write(&self, p: &[&str], c: &str) -> Result<(), logos_vfs::VfsError> { self.0.write(p, c).await }
-        async fn patch(&self, p: &[&str], c: &str) -> Result<(), logos_vfs::VfsError> { self.0.patch(p, c).await }
-    }
 
     table.mount(Box::new(MmRef(Arc::clone(&mm_arc))));
     table.mount(Box::new(SysRef(Arc::clone(&system_arc))));
@@ -358,4 +360,290 @@ async fn simulate_middleware_validation() {
         .await;
     assert!(result.is_err());
     println!("  ✓ Invalid JSON write to memory/ rejected by middleware");
+}
+
+// ===================================================================
+// Phase 9–14: Previously untested functionality
+// ===================================================================
+
+/// Resume flow: logos_complete with resume discards current task and activates target.
+
+/// Resume flow: logos_complete with resume discards current task and activates target.
+#[tokio::test]
+async fn simulate_resume_flow() {
+    let (_table, system, _mm, _dir) = boot_kernel().await;
+
+    println!("=== Phase 11: Resume flow ===");
+
+    // Create two tasks
+    system
+        .create_task(r#"{"task_id":"t-current","description":"current empty task","chat_id":"c-1"}"#)
+        .await
+        .unwrap();
+    system.transition_task("t-current", "active").await.unwrap();
+
+    system
+        .create_task(r#"{"task_id":"t-sleeping","description":"sleeping task","chat_id":"c-1"}"#)
+        .await
+        .unwrap();
+    system.transition_task("t-sleeping", "active").await.unwrap();
+    system.transition_task("t-sleeping", "sleep").await.unwrap();
+
+    // Resume: discard t-current, activate t-sleeping
+    let result = system
+        .complete(logos_system::complete::CompleteParams {
+            task_id: "t-current".to_string(),
+            summary: "Routing to sleeping task".to_string(),
+            reply: String::new(),
+            anchor: false,
+            anchor_facts: String::new(),
+            task_log: String::new(),
+            sleep_reason: String::new(),
+            sleep_retry: false,
+            resume_task_id: "t-sleeping".to_string(),
+        })
+        .await
+        .unwrap();
+    assert!(result.anchor_id.is_empty());
+    println!("  ✓ Resume completed");
+
+    // t-current should be deleted
+    let current = system.get_task("t-current").await.unwrap();
+    assert!(current.is_none());
+    println!("  ✓ Current task deleted");
+
+    // t-sleeping should be active again
+    let sleeping = system.get_task("t-sleeping").await.unwrap().unwrap();
+    assert!(sleeping.contains("\"active\""));
+    println!("  ✓ Target task reactivated");
+}
+
+/// Summary tree drill-down: long → mid → short → range_fetch.
+#[tokio::test]
+async fn simulate_summary_drill_down() {
+    let (table, _system, mm, _dir) = boot_kernel().await;
+
+    println!("=== Phase 12: Summary tree drill-down ===");
+
+    // Write some messages
+    for i in 0..5 {
+        table
+            .write(
+                "logos://memory/groups/chat-drill/messages",
+                &format!(
+                    r#"{{"ts":"2026-03-20T10:{:02}:00Z","speaker":"yao","text":"drill message {}"}}"#,
+                    i, i
+                ),
+            )
+            .await
+            .unwrap();
+    }
+
+    // Write summaries at all 3 layers
+    table
+        .write(
+            "logos://memory/groups/chat-drill/summary/short/2026-03-20T10",
+            r#"{"layer":"short","period_start":"2026-03-20T10","period_end":"2026-03-20T10","source_refs":"[[1,5]]","content":"yao 发了5条 drill 测试消息"}"#,
+        )
+        .await
+        .unwrap();
+
+    table
+        .write(
+            "logos://memory/groups/chat-drill/summary/mid/2026-03-20",
+            r#"{"layer":"mid","period_start":"2026-03-20","period_end":"2026-03-20","source_refs":"[\"2026-03-20T10\"]","content":"3月20日：yao 做了 drill 测试"}"#,
+        )
+        .await
+        .unwrap();
+
+    table
+        .write(
+            "logos://memory/groups/chat-drill/summary/long/2026-03",
+            r#"{"layer":"long","period_start":"2026-03","period_end":"2026-03","source_refs":"[\"2026-03-20\"]","content":"2026年3月：drill 测试月"}"#,
+        )
+        .await
+        .unwrap();
+
+    // Drill down: long → mid → short → messages
+    let long = table
+        .read("logos://memory/groups/chat-drill/summary/long/2026-03")
+        .await
+        .unwrap();
+    assert!(long.contains("drill 测试月"));
+    println!("  ✓ Read long summary");
+
+    let mid = table
+        .read("logos://memory/groups/chat-drill/summary/mid/2026-03-20")
+        .await
+        .unwrap();
+    assert!(mid.contains("drill 测试"));
+    println!("  ✓ Read mid summary");
+
+    let short = table
+        .read("logos://memory/groups/chat-drill/summary/short/2026-03-20T10")
+        .await
+        .unwrap();
+    assert!(short.contains("5条 drill"));
+    println!("  ✓ Read short summary");
+
+    // Range fetch raw messages from source_refs
+    let messages = mm
+        .handle_call(
+            "memory.range_fetch",
+            r#"{"chat_id":"chat-drill","ranges":[[1,5]],"limit":10}"#,
+        )
+        .await
+        .unwrap();
+    let arr: Vec<serde_json::Value> = serde_json::from_str(&messages).unwrap();
+    assert_eq!(arr.len(), 5);
+    println!("  ✓ Range fetch returned 5 raw messages");
+}
+
+/// Session clustering: LIKE false match prevention (#10).
+#[tokio::test]
+async fn session_like_no_false_match() {
+    // Test that msg_id=1 doesn't falsely match msg_id=10 or msg_id=100
+    let sessions = logos_mm::SessionStore::new(64, 256);
+
+    // Insert messages with msg_ids 1, 10, 100 into separate sessions
+    sessions.observe(logos_session::MsgRef {
+        msg_id: 1,
+        chat_id: "c-1".to_string(),
+        reply_to: None,
+        text: "msg one".to_string(),
+        speaker: "alice".to_string(),
+        ts: "2026-03-20T10:00:00Z".to_string(),
+    }).await;
+    sessions.observe(logos_session::MsgRef {
+        msg_id: 10,
+        chat_id: "c-1".to_string(),
+        reply_to: None,
+        text: "msg ten".to_string(),
+        speaker: "bob".to_string(),
+        ts: "2026-03-20T10:01:00Z".to_string(),
+    }).await;
+    sessions.observe(logos_session::MsgRef {
+        msg_id: 100,
+        chat_id: "c-1".to_string(),
+        reply_to: None,
+        text: "msg hundred".to_string(),
+        speaker: "charlie".to_string(),
+        ts: "2026-03-20T10:02:00Z".to_string(),
+    }).await;
+
+    // Each should be in its own session
+    let s1 = sessions.get_session_for_msg(1).await.unwrap();
+    let s10 = sessions.get_session_for_msg(10).await.unwrap();
+    let s100 = sessions.get_session_for_msg(100).await.unwrap();
+
+    assert_ne!(s1.session_id, s10.session_id);
+    assert_ne!(s1.session_id, s100.session_id);
+    assert_ne!(s10.session_id, s100.session_id);
+
+    // msg_id=1 session should only have 1 message
+    assert_eq!(s1.messages.len(), 1);
+    assert_eq!(s1.messages[0].msg_id, 1);
+    println!("  ✓ msg_id 1, 10, 100 are in separate sessions (no LIKE false match)");
+}
+
+/// FTS5 special character escaping.
+#[tokio::test]
+async fn fts5_special_characters() {
+    let (table, _system, mm, _dir) = boot_kernel().await;
+
+    println!("=== Phase 14: FTS5 special characters ===");
+
+    // Write message with special characters
+    table
+        .write(
+            "logos://memory/groups/chat-fts/messages",
+            r#"{"ts":"2026-03-20T10:00:00Z","speaker":"yao","text":"npm ERR! code ERESOLVE\nnpm ERR! ERESOLVE unable to resolve dependency tree"}"#,
+        )
+        .await
+        .unwrap();
+
+    table
+        .write(
+            "logos://memory/groups/chat-fts/messages",
+            r#"{"ts":"2026-03-20T10:01:00Z","speaker":"yao","text":"connection_pool.max_size = 10"}"#,
+        )
+        .await
+        .unwrap();
+
+    // Search for text with special chars
+    let result = mm
+        .handle_call(
+            "memory.search",
+            r#"{"chat_id":"chat-fts","query":"ERESOLVE","limit":10}"#,
+        )
+        .await
+        .unwrap();
+    assert!(result.contains("ERESOLVE"));
+    println!("  ✓ FTS5 search with special chars (ERESOLVE)");
+
+    let result = mm
+        .handle_call(
+            "memory.search",
+            r#"{"chat_id":"chat-fts","query":"connection_pool","limit":10}"#,
+        )
+        .await
+        .unwrap();
+    assert!(result.contains("connection_pool"));
+    println!("  ✓ FTS5 search with underscores");
+}
+
+/// VFS routing: unknown namespace rejected (table not open already tested in logos_vfs unit tests).
+#[tokio::test]
+async fn vfs_unknown_namespace_rejected() {
+    let (table, _system, _mm, _dir) = boot_kernel().await;
+
+    let result = table.read("logos://nonexistent/path").await;
+    assert!(result.is_err());
+    println!("  ✓ Unknown namespace rejected");
+}
+
+/// Multiple groups: messages in different groups don't leak.
+#[tokio::test]
+async fn multi_group_isolation() {
+    let (table, _system, mm, _dir) = boot_kernel().await;
+
+    println!("=== Phase 16: Multi-group isolation ===");
+
+    table
+        .write(
+            "logos://memory/groups/group-A/messages",
+            r#"{"ts":"2026-03-20T10:00:00Z","speaker":"alice","text":"secret message in A"}"#,
+        )
+        .await
+        .unwrap();
+
+    table
+        .write(
+            "logos://memory/groups/group-B/messages",
+            r#"{"ts":"2026-03-20T10:00:00Z","speaker":"bob","text":"public message in B"}"#,
+        )
+        .await
+        .unwrap();
+
+    // Search in group-A should not find group-B content
+    let result = mm
+        .handle_call(
+            "memory.search",
+            r#"{"chat_id":"group-A","query":"public","limit":10}"#,
+        )
+        .await
+        .unwrap();
+    assert!(!result.contains("public message in B"));
+    println!("  ✓ group-A search doesn't leak group-B content");
+
+    // Search in group-B should not find group-A content
+    let result = mm
+        .handle_call(
+            "memory.search",
+            r#"{"chat_id":"group-B","query":"secret","limit":10}"#,
+        )
+        .await
+        .unwrap();
+    assert!(!result.contains("secret message in A"));
+    println!("  ✓ group-B search doesn't leak group-A content");
 }

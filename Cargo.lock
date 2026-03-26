@@ -4216,6 +4216,7 @@ dependencies = [
  "dotenvy",
  "futures-util",
  "logos-mm",
+ "logos-session",
  "logos-system",
  "logos-vfs",
  "prost 0.14.3",
