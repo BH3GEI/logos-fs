@@ -153,9 +153,10 @@ impl Logos for LogosService {
 
     async fn exec(&self, request: Request<ExecReq>) -> Result<Response<ExecRes>, Status> {
         let info = extract_session_info(&self.tokens, &request).await;
-        let agent_id = info.map(|i| i.agent_id).unwrap_or_else(|| "__default__".to_string());
+        // No session = no exec (management interface doesn't need exec)
+        let si = info.ok_or_else(|| Status::unauthenticated("exec requires a valid session"))?;
         let command = request.into_inner().command;
-        let result = self.sandbox.exec(&command, &agent_id).await.map_err(vfs_to_status)?;
+        let result = self.sandbox.exec(&command, &si.agent_id).await.map_err(vfs_to_status)?;
         Ok(Response::new(ExecRes {
             stdout: result.stdout,
             stderr: result.stderr,
@@ -164,6 +165,9 @@ impl Logos for LogosService {
     }
 
     async fn call(&self, request: Request<CallReq>) -> Result<Response<CallRes>, Status> {
+        let info = extract_session_info(&self.tokens, &request).await;
+        // No session = no call (management interface doesn't need proc tools)
+        let _si = info.ok_or_else(|| Status::unauthenticated("call requires a valid session"))?;
         let req = request.into_inner();
         let result_json = self.proc_ns.call(&req.tool, &req.params_json)
             .await
