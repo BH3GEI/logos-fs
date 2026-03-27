@@ -46,7 +46,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 2. memory/
     let memory_root = env_path("VFS_MEMORY_ROOT", "../../data/state/memory");
-    let sessions = Arc::new(logos_mm::SessionStore::new(64, 256));
+    let session_db = memory_root.join("sessions.db");
+    let sessions = Arc::new(
+        logos_mm::SessionStore::with_sqlite(session_db, 64, 256)
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("[logos] session db init failed ({e}), using in-memory only");
+                logos_mm::SessionStore::new(64, 256)
+            })
+    );
     let memory_ns = logos_mm::MemoryModule::init(memory_root, Arc::clone(&sessions))?;
     let mm_arc = Arc::new(memory_ns);
     table.mount(Box::new(MemoryNsRef(Arc::clone(&mm_arc))));
