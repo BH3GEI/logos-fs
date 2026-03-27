@@ -1,6 +1,6 @@
 # logos-fs
 
-Logos 数据内核 — 基于 URI 寻址的虚拟文件系统，通过 gRPC 提供 6 个 agent 原语，上层经 MCP (JSON-RPC 2.0) 适配后供 AI agent 使用。
+Logos 数据内核 — 基于 URI 寻址的虚拟文件系统，通过 gRPC 提供 5 个 agent 原语，上层经 MCP (JSON-RPC 2.0) 适配后供 AI agent 使用。
 
 ```
 AI Agent → MCP (JSON-RPC) → gRPC 内核 → VFS 路由表 → 命名空间
@@ -15,16 +15,17 @@ AI Agent → MCP (JSON-RPC) → gRPC 内核 → VFS 路由表 → 命名空间
 | **Read** | uri | content | URI 路由 → namespace.read |
 | **Write** | uri, content | — | URI 路由 → namespace.write |
 | **Patch** | uri, partial | — | URI 路由 → namespace.patch（通常 JSON deep merge） |
-| **Exec** | command | stdout, stderr, exit_code | 沙箱容器执行 shell，命令中 `logos://` 自动翻译为容器路径 |
-| **Call** | tool, params_json | result_json | proc 工具分发（内置或外部 git 项目） |
-| **Complete** | summary, reply, anchor, task_log, sleep_reason, sleep_retry, resume_task_id, anchor_facts | reply, anchor_id | turn 终止符：写日志、建锚点、切任务、进睡眠 |
+| **Exec** | command | stdout, stderr, exit_code | agent 沙箱容器内执行 shell，命令中 `logos://` 自动翻译为容器路径。需要有效 session。 |
+| **Call** | tool, params_json | result_json | proc 工具分发（内置或外部 git 项目）。需要有效 session。 |
+
+> `logos_complete` 不是内核原语——它是 runtime 侧的协议，供 runtime 实现者遵循。见 RFC 002 §9.1。
 
 管理接口（runtime 调用，非 agent 调用）：
 
 | RPC | 用途 |
 |-----|------|
 | **Handshake** | 一次性 token 消费 → 绑定 session |
-| **RegisterToken** | runtime 预注册 token（token, task_id, role） |
+| **RegisterToken** | runtime 预注册 token（token, task_id, agent_config_id, role） |
 | **RevokeToken** | 撤销未使用的 token |
 
 ## 二、命名空间总览
@@ -33,7 +34,7 @@ AI Agent → MCP (JSON-RPC) → gRPC 内核 → VFS 路由表 → 命名空间
 |---|---------|------|:----:|------|
 | 1 | **memory** | SQLite (per-gid) + FTS5 | ✓ | 聊天消息、三层摘要、视图查询 |
 | 2 | **system** | SQLite | ✓ | 任务状态机、锚点、搜索 |
-| 3 | **sandbox** | 宿主 FS → Docker bind-mount | ✓ | 每任务工作目录 + 执行环境 |
+| 3 | **sandbox** | 宿主 FS → Docker bind-mount | ✓ | 每 agent 工作目录 + 执行环境 |
 | 4 | **users** | 文件系统 | ✓ | 用户档案、偏好、渐进式画像 |
 | 5 | **proc** | 内存 call slot | ✗ | 工具注册表 + 调用会话 |
 | 6 | **proc-store** | 文件系统 + git clone | ✓ | 外部工具声明与代码分发 |
@@ -77,7 +78,8 @@ AI Agent → MCP (JSON-RPC) → gRPC 内核 → VFS 路由表 → 命名空间
 | `__system__/proc/{name}/` | 工具代码目录 | — | — |
 | `__system__/svc/{name}/` | 服务制品目录 | — | — |
 
-> 容器内映射：`logos://sandbox/{task_id}/...` → `/workspace/...`
+> 容器按 agent_config_id 建（不是 task_id），同一 agent 的不同 task 共用一个容器。
+> URI 翻译：`logos://sandbox/{task_id}/...` → `/workspace/...`
 
 ### 4. users
 
@@ -156,7 +158,7 @@ AI Agent → MCP (JSON-RPC) → gRPC 内核 → VFS 路由表 → 命名空间
 
 | 子系统 | 存储 | 职责 |
 |--------|------|------|
-| **Token Registry** | 内存（24h TTL） | 一次性 token → session 绑定；role = User / Admin |
+| **Token Registry** | 内存（24h TTL） | 一次性 token → session 绑定；role = User / Admin；携带 agent_config_id |
 | **Session Clustering** | 内存 L0/L1 + LanceDB L2 | 基于 reply chain 的会话聚类，三层 LRU 淘汰 |
 | **Cron Scheduler** | 内存 job 表 | 60s tick，cron 表达式匹配 → 创建 pending task |
 | **Consolidator** | 注册 4 个 cron job | 渐进式记忆压缩：消息→小时摘要→日摘要；画像同理 |
@@ -186,9 +188,10 @@ AI Agent → MCP (JSON-RPC) → gRPC 内核 → VFS 路由表 → 命名空间
 
 | 规则 | 描述 |
 |------|------|
-| Sandbox 隔离 | task 只能访问 `sandbox/{own_task_id}/`，不能越界 |
-| 只读命名空间 | User 角色不可写 `services/`、`system/`、`devices/` |
-| 无 session = Admin | 管理接口调用（无 header）视为 admin |
+| Sandbox 隔离 | owner task 可读写自己的 sandbox；非 owner 只能读 finished 状态的 task sandbox |
+| 命名空间权限 | User 角色不可写 `services/`、`system/`、`devices/` |
+| Exec/Call 认证 | Exec 和 Call 需要有效 session（不允许匿名执行） |
+| 无 session = Admin | 管理接口对 Read/Write/Patch 的调用（无 header）视为 admin |
 | JSON 校验 | `system/`、`memory/` 的 write/patch 前必须是合法 JSON |
 
 ## 七、MCP 适配层
@@ -197,9 +200,9 @@ AI Agent → MCP (JSON-RPC) → gRPC 内核 → VFS 路由表 → 命名空间
 |----------|--------|
 | `logos_read` | gRPC Read |
 | `logos_write` | gRPC Write |
+| `logos_patch` | gRPC Patch |
 | `logos_exec` | gRPC Exec |
 | `logos_call` | gRPC Call |
-| `logos_complete` | gRPC Complete |
 
 ## 八、启动顺序
 
@@ -215,12 +218,12 @@ users → memory → system → tmp → sandbox(创建)
 
 ```
 logos-fs/
-├── proto/logos.proto          # gRPC 服务定义
+├── proto/logos.proto          # gRPC 服务定义（5 原语 + 管理接口）
 ├── crates/
 │   ├── logos-vfs/             # VFS 核心：Namespace trait, RoutingTable, URI 解析, Middleware
 │   ├── logos-kernel/          # 内核：gRPC 实现, 命名空间挂载, Token, Cron, Consolidator, Context
 │   ├── logos-mm/              # 记忆模块：消息存储, 摘要, 视图, FTS5
-│   ├── logos-system/          # 系统模块：任务状态机, 锚点, 搜索, Complete 处理
+│   ├── logos-system/          # 系统模块：任务状态机, 锚点, 搜索
 │   ├── logos-session/         # 会话聚类：reply chain 拓扑, 三层 LRU, LanceDB L2
-│   └── logos-mcp/             # MCP 适配器：gRPC → JSON-RPC 2.0
+│   └── logos-mcp/             # MCP 适配器：gRPC → JSON-RPC 2.0（5 个工具）
 ```

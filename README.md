@@ -1,6 +1,6 @@
 # logos-fs
 
-URI-addressed virtual filesystem data kernel. Exposes 6 agent primitives over gRPC, adapted to AI agents via MCP (JSON-RPC 2.0).
+URI-addressed virtual filesystem data kernel. Exposes 5 agent primitives over gRPC, adapted to AI agents via MCP (JSON-RPC 2.0).
 
 ```
 AI Agent → MCP (JSON-RPC) → gRPC Kernel → VFS Routing Table → Namespaces
@@ -15,16 +15,17 @@ AI Agent → MCP (JSON-RPC) → gRPC Kernel → VFS Routing Table → Namespaces
 | **Read** | uri | content | URI-routed → namespace.read |
 | **Write** | uri, content | — | URI-routed → namespace.write |
 | **Patch** | uri, partial | — | URI-routed → namespace.patch (typically JSON deep merge) |
-| **Exec** | command | stdout, stderr, exit_code | Shell execution in sandbox container; `logos://` in commands auto-translated to container paths |
-| **Call** | tool, params_json | result_json | Proc tool dispatch (built-in or external git projects) |
-| **Complete** | summary, reply, anchor, task_log, sleep_reason, sleep_retry, resume_task_id, anchor_facts | reply, anchor_id | Turn terminator: write log, create anchor, switch task, enter sleep |
+| **Exec** | command | stdout, stderr, exit_code | Shell execution in agent's sandbox container; `logos://` in commands auto-translated to container paths. Requires valid session. |
+| **Call** | tool, params_json | result_json | Proc tool dispatch (built-in or external git projects). Requires valid session. |
+
+> `logos_complete` is NOT a kernel primitive — it is a runtime-side protocol for runtime implementors. See RFC 002 §9.1.
 
 Management interface (called by runtime, not agents):
 
 | RPC | Purpose |
 |-----|---------|
 | **Handshake** | Consume one-time token → bind session |
-| **RegisterToken** | Runtime pre-registers token (token, task_id, role) |
+| **RegisterToken** | Runtime pre-registers token (token, task_id, agent_config_id, role) |
 | **RevokeToken** | Revoke unused token |
 
 ## 2. Namespace Overview
@@ -33,7 +34,7 @@ Management interface (called by runtime, not agents):
 |---|-----------|---------|:----------:|---------|
 | 1 | **memory** | SQLite (per-gid) + FTS5 | ✓ | Chat messages, 3-layer summaries, view queries |
 | 2 | **system** | SQLite | ✓ | Task state machine, anchors, search |
-| 3 | **sandbox** | Host FS → Docker bind-mount | ✓ | Per-task working directory + execution environment |
+| 3 | **sandbox** | Host FS → Docker bind-mount | ✓ | Per-agent working directory + execution environment |
 | 4 | **users** | Filesystem | ✓ | User profiles, preferences, progressive persona |
 | 5 | **proc** | In-memory call slots | ✗ | Tool registry + call sessions |
 | 6 | **proc-store** | Filesystem + git clone | ✓ | External tool declarations & code distribution |
@@ -77,7 +78,8 @@ Management interface (called by runtime, not agents):
 | `__system__/proc/{name}/` | Tool code directory | — | — |
 | `__system__/svc/{name}/` | Service artifact directory | — | — |
 
-> Container mapping: `logos://sandbox/{task_id}/...` → `/workspace/...`
+> Containers are keyed by agent_config_id (not task_id). Multiple tasks from the same agent share one container.
+> URI translation: `logos://sandbox/{task_id}/...` → `/workspace/...`
 
 ### 3.4 users
 
@@ -156,7 +158,7 @@ Management interface (called by runtime, not agents):
 
 | Subsystem | Storage | Purpose |
 |-----------|---------|---------|
-| **Token Registry** | In-memory (24h TTL) | One-time token → session binding; role = User / Admin |
+| **Token Registry** | In-memory (24h TTL) | One-time token → session binding; role = User / Admin; carries agent_config_id |
 | **Session Clustering** | In-memory L0/L1 + LanceDB L2 | Reply-chain-based session clustering, 3-layer LRU eviction |
 | **Cron Scheduler** | In-memory job table | 60s tick, cron expression matching → create pending task |
 | **Consolidator** | 4 registered cron jobs | Progressive memory compression: messages → hourly → daily summaries; persona likewise |
@@ -186,9 +188,10 @@ Management interface (called by runtime, not agents):
 
 | Rule | Description |
 |------|-------------|
-| Sandbox isolation | Task can only access `sandbox/{own_task_id}/`, no cross-access |
-| Read-only namespaces | User role cannot write to `services/`, `system/`, `devices/` |
-| No session = Admin | Management interface calls (no header) treated as admin |
+| Sandbox isolation | Owner task can read/write own sandbox; non-owner can only read finished tasks' sandboxes |
+| Namespace permissions | User role cannot write to `services/`, `system/`, `devices/` |
+| Exec/Call auth | Exec and Call require a valid session (no anonymous execution) |
+| No session = Admin | Management interface calls (no header) on Read/Write/Patch treated as admin |
 | JSON validation | Writes/patches to `system/` and `memory/` must be valid JSON |
 
 ## 7. MCP Adapter
@@ -197,9 +200,9 @@ Management interface (called by runtime, not agents):
 |----------|---------|
 | `logos_read` | gRPC Read |
 | `logos_write` | gRPC Write |
+| `logos_patch` | gRPC Patch |
 | `logos_exec` | gRPC Exec |
 | `logos_call` | gRPC Call |
-| `logos_complete` | gRPC Complete |
 
 ## 8. Boot Sequence
 
@@ -215,12 +218,12 @@ users → memory → system → tmp → sandbox (create)
 
 ```
 logos-fs/
-├── proto/logos.proto          # gRPC service definition
+├── proto/logos.proto          # gRPC service definition (5 primitives + management)
 ├── crates/
 │   ├── logos-vfs/             # VFS core: Namespace trait, RoutingTable, URI parsing, Middleware
 │   ├── logos-kernel/          # Kernel: gRPC impl, namespace mounting, Token, Cron, Consolidator, Context
 │   ├── logos-mm/              # Memory module: message storage, summaries, views, FTS5
-│   ├── logos-system/          # System module: task state machine, anchors, search, Complete handler
+│   ├── logos-system/          # System module: task state machine, anchors, search
 │   ├── logos-session/         # Session clustering: reply-chain topology, 3-layer LRU, LanceDB L2
-│   └── logos-mcp/             # MCP adapter: gRPC → JSON-RPC 2.0
+│   └── logos-mcp/             # MCP adapter: gRPC → JSON-RPC 2.0 (5 tools)
 ```
