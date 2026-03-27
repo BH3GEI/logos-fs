@@ -1,5 +1,7 @@
 mod messages;
+pub mod plugin;
 mod summaries;
+mod graph;
 pub mod views;
 
 use std::collections::HashMap;
@@ -10,7 +12,7 @@ use async_trait::async_trait;
 use logos_vfs::{Namespace, VfsError};
 
 use messages::MessageDb;
-use summaries::SummaryDb;
+use plugin::MemoryPlugin;
 use views::MemoryView;
 
 pub use logos_session::SessionStore;
@@ -33,6 +35,7 @@ pub struct MemoryModule {
     messages: MessageDb,
     sessions: Arc<SessionStore>,
     views: HashMap<String, Box<dyn views::MemoryView>>,
+    plugins: Vec<Box<dyn MemoryPlugin>>,
 }
 
 impl MemoryModule {
@@ -43,11 +46,27 @@ impl MemoryModule {
         view_map.insert(by_speaker.name().to_string(), Box::new(by_speaker));
         let recent = views::RecentView;
         view_map.insert(recent.name().to_string(), Box::new(recent));
+
+        // Mount default plugins (RFC 003 §11)
+        let plugins: Vec<Box<dyn MemoryPlugin>> = vec![
+            Box::new(summaries::HierarchicalPlugin),
+            Box::new(graph::GraphPlugin),
+        ];
+
         Ok(Self {
             messages,
             sessions,
             views: view_map,
+            plugins,
         })
+    }
+
+    /// List mounted plugins (for logos://memory/plugins/ discovery).
+    pub fn plugin_list(&self) -> Vec<serde_json::Value> {
+        self.plugins.iter().map(|p| serde_json::json!({
+            "name": p.name(),
+            "docs": p.docs(),
+        })).collect()
     }
 
     /// Access the session store (for runtime context injection — RFC 003 §5.5).
@@ -92,6 +111,12 @@ impl Namespace for MemoryModule {
     }
 
     async fn read(&self, path: &[&str]) -> Result<String, VfsError> {
+        // logos://memory/plugins/ → plugin discovery (RFC 003 §11.3)
+        if path.first() == Some(&"plugins") {
+            return Ok(serde_json::to_string(&self.plugin_list())
+                .unwrap_or_else(|_| "[]".to_string()));
+        }
+
         if path.len() < 3 || path[0] != "groups" {
             return Err(VfsError::InvalidPath(
                 "expected logos://memory/groups/{gid}/...".to_string(),
@@ -100,47 +125,43 @@ impl Namespace for MemoryModule {
         let gid = path[1];
         let resource = path[2];
 
-        match resource {
-            "messages" => {
-                let msg_id_str = path.get(3).ok_or_else(|| {
-                    VfsError::InvalidPath("expected logos://memory/groups/{gid}/messages/{msg_id}".to_string())
-                })?;
-                let msg_id: i64 = msg_id_str
-                    .parse()
-                    .map_err(|_| VfsError::InvalidPath(format!("invalid msg_id: {msg_id_str}")))?;
-                self.messages
-                    .get_by_id(gid, msg_id)
-                    .await
-                    .map(|opt| opt.unwrap_or_else(|| "null".to_string()))
-            }
-            "summary" => {
-                let layer = path.get(3).ok_or_else(|| {
-                    VfsError::InvalidPath("missing summary layer".to_string())
-                })?;
-                let period = path.get(4).copied().unwrap_or("latest");
-                let pool = self.messages.pool(gid).await?;
-                SummaryDb::ensure_schema(&pool).await?;
-                SummaryDb::read(pool, gid, layer, period)
-                    .await
-                    .map(|opt| opt.unwrap_or_else(|| "null".to_string()))
-            }
-            // logos://memory/groups/{gid}/views/{view_name}
-            "views" => {
-                let view_name = path.get(3).ok_or_else(|| {
-                    VfsError::InvalidPath("missing view name".to_string())
-                })?;
-                let view = self.views.get(*view_name).ok_or_else(|| {
-                    VfsError::NotFound(format!("unknown view: {view_name}"))
-                })?;
-                // Remaining path segments joined as params JSON (or empty)
-                let params = path.get(4).copied().unwrap_or("{}");
-                let pool = self.messages.pool(gid).await?;
-                view.query(&pool, gid, params).await
-            }
-            _ => Err(VfsError::InvalidPath(format!(
-                "unknown memory resource: {resource}"
-            ))),
+        // Core: messages
+        if resource == "messages" {
+            let msg_id_str = path.get(3).ok_or_else(|| {
+                VfsError::InvalidPath("expected logos://memory/groups/{gid}/messages/{msg_id}".to_string())
+            })?;
+            let msg_id: i64 = msg_id_str
+                .parse()
+                .map_err(|_| VfsError::InvalidPath(format!("invalid msg_id: {msg_id_str}")))?;
+            return self.messages
+                .get_by_id(gid, msg_id)
+                .await
+                .map(|opt| opt.unwrap_or_else(|| "null".to_string()));
         }
+
+        // Core: views
+        if resource == "views" {
+            let view_name = path.get(3).ok_or_else(|| {
+                VfsError::InvalidPath("missing view name".to_string())
+            })?;
+            let view = self.views.get(*view_name).ok_or_else(|| {
+                VfsError::NotFound(format!("unknown view: {view_name}"))
+            })?;
+            let params = path.get(4).copied().unwrap_or("{}");
+            let pool = self.messages.pool(gid).await?;
+            return view.query(&pool, gid, params).await;
+        }
+
+        // Check plugins
+        for plugin in &self.plugins {
+            if plugin.name() == resource {
+                let pool = self.messages.pool(gid).await?;
+                plugin.init_schema(&pool).await?;
+                return plugin.read(&pool, gid, &path[3..]).await;
+            }
+        }
+
+        Err(VfsError::InvalidPath(format!("unknown memory resource: {resource}")))
     }
 
     async fn write(&self, path: &[&str], content: &str) -> Result<(), VfsError> {
@@ -152,58 +173,55 @@ impl Namespace for MemoryModule {
         let gid = path[1];
         let resource = path[2];
 
-        match resource {
-            "messages" => {
-                let msg_id = self.messages.insert(gid, content).await?;
+        // Core: messages
+        if resource == "messages" {
+            let msg_id = self.messages.insert(gid, content).await?;
 
-                // Update session topology (RFC 003 §5.1)
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(content) {
-                    let msg_ref = logos_session::MsgRef {
-                        msg_id,
-                        chat_id: gid.to_string(),
-                        reply_to: val["reply_to"].as_i64(),
-                        text: val["text"].as_str().unwrap_or_default().to_string(),
-                        speaker: val["speaker"].as_str().unwrap_or_default().to_string(),
-                        ts: val["ts"].as_str().unwrap_or_default().to_string(),
-                    };
-                    self.sessions.observe(msg_ref).await;
-                }
-
-                Ok(())
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(content) {
+                let msg_ref = logos_session::MsgRef {
+                    msg_id,
+                    chat_id: gid.to_string(),
+                    reply_to: val["reply_to"].as_i64(),
+                    text: val["text"].as_str().unwrap_or_default().to_string(),
+                    speaker: val["speaker"].as_str().unwrap_or_default().to_string(),
+                    ts: val["ts"].as_str().unwrap_or_default().to_string(),
+                };
+                self.sessions.observe(msg_ref).await;
             }
-            "summary" => {
-                if path.len() < 5 {
-                    return Err(VfsError::InvalidPath(
-                        "expected logos://memory/groups/{gid}/summary/{layer}/{period}".to_string(),
-                    ));
-                }
-                let pool = self.messages.pool(gid).await?;
-                SummaryDb::ensure_schema(&pool).await?;
-                SummaryDb::write(pool, gid, content).await
-            }
-            _ => Err(VfsError::InvalidPath(format!(
-                "unknown memory resource for write: {resource}"
-            ))),
+            return Ok(());
         }
+
+        // Check plugins
+        for plugin in &self.plugins {
+            if plugin.name() == resource {
+                let pool = self.messages.pool(gid).await?;
+                plugin.init_schema(&pool).await?;
+                return plugin.write(&pool, gid, &path[3..], content).await;
+            }
+        }
+
+        Err(VfsError::InvalidPath(format!("unknown memory resource for write: {resource}")))
     }
 
     async fn patch(&self, path: &[&str], partial: &str) -> Result<(), VfsError> {
-        // For summary resources: read-merge-write with deep merge.
-        // For messages: patch is not meaningful (append-only), fall through to write.
-        if path.len() >= 3 && path[2] == "summary" {
-            let existing = self.read(path).await.unwrap_or_else(|_| "null".to_string());
-            if let (Ok(mut base), Ok(patch_val)) = (
-                serde_json::from_str::<serde_json::Value>(&existing),
-                serde_json::from_str::<serde_json::Value>(partial),
-            ) {
-                if !base.is_null() {
-                    logos_vfs::json_deep_merge(&mut base, &patch_val);
-                    let merged = serde_json::to_string(&base)
-                        .unwrap_or_else(|_| partial.to_string());
-                    return self.write(path, &merged).await;
-                }
+        if path.len() < 3 || path[0] != "groups" {
+            return Err(VfsError::InvalidPath(
+                "expected logos://memory/groups/{gid}/...".to_string(),
+            ));
+        }
+        let gid = path[1];
+        let resource = path[2];
+
+        // Check plugins
+        for plugin in &self.plugins {
+            if plugin.name() == resource {
+                let pool = self.messages.pool(gid).await?;
+                plugin.init_schema(&pool).await?;
+                return plugin.patch(&pool, gid, &path[3..], partial).await;
             }
         }
+
+        // Fallback: messages (append-only, patch = write)
         self.write(path, partial).await
     }
 }
@@ -290,6 +308,46 @@ mod tests {
         ).await.unwrap();
         let arr: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
         assert_eq!(arr.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn plugin_discovery() {
+        let (mm, _dir) = test_mm().await;
+        let result = mm.read(&["plugins"]).await.unwrap();
+        let plugins: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+        let names: Vec<&str> = plugins.iter().map(|p| p["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"summary"));
+        assert!(names.contains(&"graph"));
+    }
+
+    #[tokio::test]
+    async fn graph_write_and_read() {
+        let (mm, _dir) = test_mm().await;
+
+        // Write triples about alice
+        mm.write(&["groups", "chat-1", "graph", "alice"], r#"[
+            {"predicate": "是", "object": "后端工程师"},
+            {"predicate": "works_on", "object": "logos"},
+            {"predicate": "likes", "object": "Rust"}
+        ]"#).await.unwrap();
+
+        // Read all triples for alice
+        let result = mm.read(&["groups", "chat-1", "graph", "alice"]).await.unwrap();
+        let triples: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+        assert_eq!(triples.len(), 3);
+        assert_eq!(triples[0]["subject"], "alice");
+
+        // List all subjects
+        let list = mm.read(&["groups", "chat-1", "graph"]).await.unwrap();
+        let subjects: Vec<String> = serde_json::from_str(&list).unwrap();
+        assert_eq!(subjects, vec!["alice"]);
+    }
+
+    #[tokio::test]
+    async fn graph_not_found() {
+        let (mm, _dir) = test_mm().await;
+        let result = mm.read(&["groups", "chat-1", "graph", "nonexistent"]).await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]

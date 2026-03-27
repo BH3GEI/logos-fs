@@ -156,7 +156,7 @@ impl Logos for LogosService {
         // No session = no exec (management interface doesn't need exec)
         let si = info.ok_or_else(|| Status::unauthenticated("exec requires a valid session"))?;
         let command = request.into_inner().command;
-        let result = self.sandbox.exec(&command, &si.agent_id).await.map_err(vfs_to_status)?;
+        let result = self.sandbox.exec(&command, &si.agent_config_id).await.map_err(vfs_to_status)?;
         Ok(Response::new(ExecRes {
             stdout: result.stdout,
             stderr: result.stderr,
@@ -173,42 +173,6 @@ impl Logos for LogosService {
             .await
             .map_err(vfs_to_status)?;
         Ok(Response::new(CallRes { result_json }))
-    }
-
-    async fn complete(
-        &self,
-        request: Request<CompleteReq>,
-    ) -> Result<Response<CompleteRes>, Status> {
-        let info = extract_session_info(&self.tokens, &request).await;
-        let task_id = info.map(|i| i.task_id).unwrap_or_default();
-        let req = request.into_inner();
-        let task_log = req.task_log.clone();
-        let tid = task_id.clone();
-        let params = logos_system::complete::CompleteParams {
-            task_id,
-            summary: req.summary,
-            reply: req.reply,
-            anchor: req.anchor,
-            anchor_facts: req.anchor_facts,
-            task_log: req.task_log,
-            sleep_reason: req.sleep_reason,
-            sleep_retry: req.sleep_retry,
-            resume_task_id: req.resume_task_id,
-        };
-        let result = self.system.complete(params).await.map_err(vfs_to_status)?;
-
-        // RFC 002 §9.1 step 3: write task_log to logos://sandbox/{task_id}/log
-        if !task_log.is_empty() && !tid.is_empty() {
-            self.sandbox
-                .patch(&[&tid, "log"], &task_log)
-                .await
-                .map_err(vfs_to_status)?;
-        }
-
-        Ok(Response::new(CompleteRes {
-            reply: result.reply,
-            anchor_id: result.anchor_id,
-        }))
     }
 
     // --- Kernel management interface ---
@@ -244,7 +208,7 @@ impl Logos for LogosService {
             return Err(Status::invalid_argument("token and task_id required"));
         }
         let role = AgentRole::from_str(&req.role);
-        self.tokens.register(req.token, req.task_id, req.agent_id, role).await;
+        self.tokens.register(req.token, req.task_id, req.agent_config_id, role).await;
         Ok(Response::new(RegisterTokenRes {}))
     }
 
@@ -271,10 +235,10 @@ mod tests {
         (sys, dir)
     }
 
-    fn make_session(task_id: &str, agent_id: &str, role: AgentRole) -> SessionInfo {
+    fn make_session(task_id: &str, agent_config_id: &str, role: AgentRole) -> SessionInfo {
         SessionInfo {
             task_id: task_id.to_string(),
-            agent_id: agent_id.to_string(),
+            agent_config_id: agent_config_id.to_string(),
             role,
         }
     }

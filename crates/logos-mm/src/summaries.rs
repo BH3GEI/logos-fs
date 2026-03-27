@@ -1,6 +1,8 @@
+use async_trait::async_trait;
 use sqlx::SqlitePool;
 
 use logos_vfs::VfsError;
+use crate::plugin::MemoryPlugin;
 
 /// Summary tree storage.
 ///
@@ -124,6 +126,54 @@ impl SummaryDb {
 
         let row = row.map_err(|e| VfsError::Sqlite(e.to_string()))?;
         Ok(row.as_ref().map(|r| summary_row_to_json(r).to_string()))
+    }
+}
+
+/// Hierarchical summary tree as a MemoryPlugin (RFC 003 §4).
+pub struct HierarchicalPlugin;
+
+#[async_trait]
+impl MemoryPlugin for HierarchicalPlugin {
+    fn name(&self) -> &str { "summary" }
+
+    fn docs(&self) -> &str {
+        "summary/ : Hierarchical summary tree. Navigate by time.\n\
+         - summary/short/latest : most recent hourly summary\n\
+         - summary/short/{date}T{hour} : specific hour\n\
+         - summary/mid/{date} : daily summary\n\
+         - summary/long/{year-month} : monthly summary\n\
+         Each node has source_refs pointing to the layer below for drill-down."
+    }
+
+    async fn init_schema(&self, pool: &SqlitePool) -> Result<(), VfsError> {
+        SummaryDb::ensure_schema(pool).await
+    }
+
+    async fn read(&self, pool: &SqlitePool, chat_id: &str, path: &[&str]) -> Result<String, VfsError> {
+        // path: [layer, period_key] e.g. ["short", "latest"] or ["mid", "2026-03-20"]
+        let layer = path.first().ok_or_else(|| VfsError::InvalidPath("missing layer".to_string()))?;
+        let period_key = path.get(1).unwrap_or(&"latest");
+        SummaryDb::read(pool.clone(), chat_id, layer, period_key)
+            .await
+            .map(|opt| opt.unwrap_or_else(|| "null".to_string()))
+    }
+
+    async fn write(&self, pool: &SqlitePool, chat_id: &str, _path: &[&str], content: &str) -> Result<(), VfsError> {
+        SummaryDb::write(pool.clone(), chat_id, content).await
+    }
+
+    async fn patch(&self, pool: &SqlitePool, chat_id: &str, path: &[&str], partial: &str) -> Result<(), VfsError> {
+        // Read existing, deep merge, write back
+        let existing = self.read(pool, chat_id, path).await?;
+        if let (Ok(mut base), Ok(patch_val)) = (
+            serde_json::from_str::<serde_json::Value>(&existing),
+            serde_json::from_str::<serde_json::Value>(partial),
+        ) {
+            logos_vfs::json_deep_merge(&mut base, &patch_val);
+            let merged = serde_json::to_string(&base).unwrap_or_else(|_| partial.to_string());
+            return self.write(pool, chat_id, path, &merged).await;
+        }
+        self.write(pool, chat_id, path, partial).await
     }
 }
 

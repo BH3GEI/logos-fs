@@ -91,5 +91,24 @@ pub async fn register_consolidator_jobs(scheduler: &CronScheduler) {
         })
         .await;
 
-    println!("[logos] registered 4 consolidator cron jobs");
+    // 5. Knowledge graph — every hour at :10 (staggered)
+    scheduler
+        .register(CronJob {
+            name: "consolidate-graph".to_string(),
+            cron_expr: "0 10 * * * *".to_string(), // sec=0, min=10, every hour
+            task_template: serde_json::json!({
+                "description": concat!(
+                    "Consolidator: extract knowledge triples for graph.\n",
+                    "1. Read messages from the past hour\n",
+                    "2. Extract (subject, predicate, object) triples\n",
+                    "3. Write to logos://memory/groups/{chat_id}/graph/{subject}\n",
+                    "   JSON: [{\"predicate\":\"...\",\"object\":\"...\"}]"
+                ),
+                "resource": "logos://memory/*/graph",
+            }),
+            enabled: true,
+        })
+        .await;
+
+    println!("[logos] registered 5 consolidator cron jobs");
 }

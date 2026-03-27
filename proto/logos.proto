@@ -5,21 +5,21 @@ package logos.kernel.v1;
 // The Logos kernel interface.
 //
 // Agent primitives: Read, Write, Patch, Exec, Call.
-// Turn terminator:  Complete.
 //
 // All data access goes through Read/Write/Patch with a logos:// URI.
 // Exec runs shell commands in sandbox containers with URI translation.
 // Call dispatches to proc tools (built-in or external git projects).
-// Complete is the mandatory final call of every agent turn.
+//
+// logos_complete is NOT a kernel primitive — it is a runtime-side protocol
+// defined in the RFC for runtime implementors to follow. See RFC 002 §9.1.
 
 service Logos {
-  // Agent primitives
+  // Agent primitives (RFC 002 §3)
   rpc Read(ReadReq) returns (ReadRes);
   rpc Write(WriteReq) returns (WriteRes);
   rpc Patch(PatchReq) returns (PatchRes);
   rpc Exec(ExecReq) returns (ExecRes);
   rpc Call(CallReq) returns (CallRes);
-  rpc Complete(CompleteReq) returns (CompleteRes);
 
   // Kernel management interface (runtime-facing, not agent-facing)
   rpc Handshake(HandshakeReq) returns (HandshakeRes);
@@ -52,30 +52,12 @@ message ExecRes {
 message CallReq { string tool = 1; string params_json = 2; }
 message CallRes { string result_json = 1; }
 
-// --- Complete: turn terminator and transaction boundary ---
-
-message CompleteReq {
-  string summary = 1;          // required: what happened this turn
-  string reply = 2;            // optional: message to deliver to the user
-  bool anchor = 3;             // optional: create a task completion anchor?
-  string task_log = 4;         // optional: execution details to append to log
-  string sleep_reason = 5;     // optional: "recoverable_error" | "awaiting_user"
-  bool sleep_retry = 6;        // optional: hint to adapter — auto-retry?
-  string resume_task_id = 7;   // optional: abandon current task, resume this one
-  string anchor_facts = 8;     // optional: JSON array of fact objects for the anchor
-}
-
-message CompleteRes {
-  string reply = 1;            // echo back for adapter delivery
-  string anchor_id = 2;        // created anchor ID, empty if anchor was false
-}
-
 // --- Kernel management: token-based task binding ---
 
 message HandshakeReq { string token = 1; }
 message HandshakeRes { bool ok = 1; string error = 2; }
 
-message RegisterTokenReq { string token = 1; string task_id = 2; string role = 3; string agent_id = 4; }
+message RegisterTokenReq { string token = 1; string task_id = 2; string role = 3; string agent_config_id = 4; }
 message RegisterTokenRes {}
 
 message RevokeTokenReq { string token = 1; }

@@ -18,7 +18,6 @@ use pb::*;
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tonic::metadata::MetadataValue;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
 
@@ -78,6 +77,18 @@ fn tool_definitions() -> serde_json::Value {
                 }
             },
             {
+                "name": "logos_patch",
+                "description": "Partially update data at a Logos URI (JSON deep merge)",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "uri": { "type": "string", "description": "Logos URI" },
+                        "partial": { "type": "string", "description": "Partial content to merge" }
+                    },
+                    "required": ["uri", "partial"]
+                }
+            },
+            {
                 "name": "logos_exec",
                 "description": "Execute a shell command in the sandbox container",
                 "inputSchema": {
@@ -98,20 +109,6 @@ fn tool_definitions() -> serde_json::Value {
                         "params": { "type": "object", "description": "Tool parameters" }
                     },
                     "required": ["tool", "params"]
-                }
-            },
-            {
-                "name": "logos_complete",
-                "description": "End the current turn (mandatory final call)",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "summary": { "type": "string", "description": "What happened this turn" },
-                        "reply": { "type": "string", "description": "Message to deliver to the user" },
-                        "anchor": { "type": "boolean", "description": "Create a task completion anchor?" },
-                        "anchor_facts": { "type": "string", "description": "JSON array of fact objects for the anchor" }
-                    },
-                    "required": ["summary"]
                 }
             }
         ]
@@ -136,15 +133,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .handshake(HandshakeReq {
                 token: token.clone(),
             })
-            .await?
-            .into_inner();
-        if !resp.ok {
-            eprintln!("handshake failed: {}", resp.error);
+            .await?;
+        // Extract session key from response metadata before consuming
+        let key = resp.metadata()
+            .get("x-logos-session")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let inner = resp.into_inner();
+        if !inner.ok {
+            eprintln!("handshake failed: {}", inner.error);
             std::process::exit(1);
         }
-        // Extract session key from response metadata (would need interceptor)
-        // For now, we'll pass token as session header
-        Some(token)
+        key
     } else {
         None
     };
@@ -199,7 +199,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn handle_request(
     client: &mut LogosClient<Channel>,
-    _session_key: &Option<String>,
+    session_key: &Option<String>,
     req: JsonRpcRequest,
 ) -> JsonRpcResponse {
     let id = req.id.clone();
@@ -217,7 +217,7 @@ async fn handle_request(
         "tools/call" => {
             let tool_name = req.params["name"].as_str().unwrap_or("");
             let arguments = &req.params["arguments"];
-            match call_tool(client, tool_name, arguments).await {
+            match call_tool(client, session_key, tool_name, arguments).await {
                 Ok(result) => JsonRpcResponse {
                     jsonrpc: "2.0".to_string(),
                     id,
@@ -270,8 +270,20 @@ async fn handle_request(
     }
 }
 
+/// Inject x-logos-session header into a tonic request.
+fn with_session<T>(req: T, session_key: &Option<String>) -> tonic::Request<T> {
+    let mut request = tonic::Request::new(req);
+    if let Some(key) = session_key {
+        if let Ok(val) = key.parse::<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>() {
+            request.metadata_mut().insert("x-logos-session", val);
+        }
+    }
+    request
+}
+
 async fn call_tool(
     client: &mut LogosClient<Channel>,
+    session_key: &Option<String>,
     tool_name: &str,
     args: &serde_json::Value,
 ) -> Result<String, String> {
@@ -279,7 +291,7 @@ async fn call_tool(
         "logos_read" => {
             let uri = args["uri"].as_str().unwrap_or("").to_string();
             let resp = client
-                .read(ReadReq { uri })
+                .read(with_session(ReadReq { uri }, session_key))
                 .await
                 .map_err(|e| e.message().to_string())?;
             Ok(resp.into_inner().content)
@@ -288,7 +300,16 @@ async fn call_tool(
             let uri = args["uri"].as_str().unwrap_or("").to_string();
             let content = args["content"].as_str().unwrap_or("").to_string();
             client
-                .write(WriteReq { uri, content })
+                .write(with_session(WriteReq { uri, content }, session_key))
+                .await
+                .map_err(|e| e.message().to_string())?;
+            Ok("ok".to_string())
+        }
+        "logos_patch" => {
+            let uri = args["uri"].as_str().unwrap_or("").to_string();
+            let partial = args["partial"].as_str().unwrap_or("").to_string();
+            client
+                .patch(with_session(PatchReq { uri, partial }, session_key))
                 .await
                 .map_err(|e| e.message().to_string())?;
             Ok("ok".to_string())
@@ -296,7 +317,7 @@ async fn call_tool(
         "logos_exec" => {
             let command = args["command"].as_str().unwrap_or("").to_string();
             let resp = client
-                .exec(ExecReq { command })
+                .exec(with_session(ExecReq { command }, session_key))
                 .await
                 .map_err(|e| e.message().to_string())?;
             let inner = resp.into_inner();
@@ -311,38 +332,13 @@ async fn call_tool(
             let tool = args["tool"].as_str().unwrap_or("").to_string();
             let params = serde_json::to_string(&args["params"]).unwrap_or_else(|_| "{}".to_string());
             let resp = client
-                .call(CallReq {
+                .call(with_session(CallReq {
                     tool,
                     params_json: params,
-                })
+                }, session_key))
                 .await
                 .map_err(|e| e.message().to_string())?;
             Ok(resp.into_inner().result_json)
-        }
-        "logos_complete" => {
-            let summary = args["summary"].as_str().unwrap_or("").to_string();
-            let reply = args["reply"].as_str().unwrap_or("").to_string();
-            let anchor = args["anchor"].as_bool().unwrap_or(false);
-            let anchor_facts = args["anchor_facts"].as_str().unwrap_or("").to_string();
-            let resp = client
-                .complete(CompleteReq {
-                    summary,
-                    reply,
-                    anchor,
-                    anchor_facts,
-                    task_log: String::new(),
-                    sleep_reason: String::new(),
-                    sleep_retry: false,
-                    resume_task_id: String::new(),
-                })
-                .await
-                .map_err(|e| e.message().to_string())?;
-            let inner = resp.into_inner();
-            Ok(serde_json::json!({
-                "reply": inner.reply,
-                "anchor_id": inner.anchor_id,
-            })
-            .to_string())
         }
         _ => Err(format!("unknown tool: {tool_name}")),
     }
@@ -360,9 +356,9 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"logos_read"));
         assert!(names.contains(&"logos_write"));
+        assert!(names.contains(&"logos_patch"));
         assert!(names.contains(&"logos_exec"));
         assert!(names.contains(&"logos_call"));
-        assert!(names.contains(&"logos_complete"));
     }
 
     #[test]

@@ -64,6 +64,21 @@ pub async fn execute(
             &params.anchor_facts,
         )
         .await?;
+
+        // RFC 003 §7.1: anchor creation triggers short summary regeneration
+        let now = chrono::Utc::now();
+        let regen_task_id = format!("regen-summary-{}", now.format("%Y%m%dT%H%M%S"));
+        let period = now.format("%Y-%m-%dT%H").to_string();
+        let regen_content = serde_json::json!({
+            "task_id": regen_task_id,
+            "description": format!(
+                "Regenerate short summary for period {period} (triggered by anchor {anchor_id})"
+            ),
+            "resource": "logos://memory/*/summary/short",
+            "chat_id": "",
+            "trigger": "anchor",
+        });
+        let _ = tasks.create(&regen_content.to_string()).await;
     }
 
     Ok(CompleteResult {
