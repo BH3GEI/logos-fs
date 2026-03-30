@@ -1,236 +1,295 @@
 # logos-fs
 
-URI-addressed virtual filesystem data kernel. Exposes 5 agent primitives over gRPC, adapted to AI agents via MCP (JSON-RPC 2.0).
+Logos 给 AI agent 提供了一套通过 URI 访问一切资源的内核：消息、记忆、任务、沙箱、工具、服务、设备，全部统一在 `logos://` 地址空间下，agent 只需要 5 个操作就能和整个系统交互。
 
 ```
-AI Agent → MCP (JSON-RPC) → gRPC Kernel → VFS Routing Table → Namespaces
+Agent --logos_call/read/write/exec--> MCP adapter (JSON-RPC stdio)
+  --> gRPC unix socket --> VFS routing table --> namespace handlers
 ```
 
 > [中文文档](./README.zh.md)
 
-## 1. gRPC Primitives
+## gRPC Service
 
-| RPC | Input | Output | Semantics |
-|-----|-------|--------|-----------|
-| **Read** | uri | content | URI-routed → namespace.read |
-| **Write** | uri, content | — | URI-routed → namespace.write |
-| **Patch** | uri, partial | — | URI-routed → namespace.patch (typically JSON deep merge) |
-| **Exec** | command | stdout, stderr, exit_code | Shell execution in agent's sandbox container; `logos://` in commands auto-translated to container paths. Requires valid session. |
-| **Call** | tool, params_json | result_json | Proc tool dispatch (built-in or external git projects). Requires valid session. |
+Proto: `proto/logos.proto`, package `logos.kernel.v1`.
 
-> `logos_complete` is NOT a kernel primitive — it is a runtime-side protocol for runtime implementors. See RFC 002 §9.1.
+### Agent Primitives
 
-Management interface (called by runtime, not agents):
+```protobuf
+rpc Read(ReadReq)   returns (ReadRes);    // uri -> content
+rpc Write(WriteReq) returns (WriteRes);   // uri, content -> ()
+rpc Patch(PatchReq) returns (PatchRes);   // uri, partial -> () (JSON deep merge)
+rpc Exec(ExecReq)   returns (ExecRes);    // command -> stdout, stderr, exit_code
+rpc Call(CallReq)   returns (CallRes);    // tool, params_json -> result_json
+```
 
-| RPC | Purpose |
-|-----|---------|
-| **Handshake** | Consume one-time token → bind session |
-| **RegisterToken** | Runtime pre-registers token (token, task_id, agent_config_id, role) |
-| **RevokeToken** | Revoke unused token |
+- `Read/Write/Patch` are pure data operations, no side effects.
+- `Exec` runs shell in the agent's sandbox container. `logos://sandbox/` and `logos://services/` URIs in commands are auto-translated to real paths. Other namespaces are not accessible via Exec.
+- `Call` dispatches to proc tools (built-in or external). This is how agents invoke `system.complete`, `memory.search`, etc.
+- All five require a valid session (established via Handshake), except management RPCs.
 
-## 2. Namespace Overview
+### Management Interface (called by runtime, not agents)
 
-| # | Namespace | Backend | Persistent | Purpose |
-|---|-----------|---------|:----------:|---------|
-| 1 | **memory** | SQLite (per-gid) + FTS5 | ✓ | Chat messages, 3-layer summaries, view queries |
-| 2 | **system** | SQLite | ✓ | Task state machine, anchors, search |
-| 3 | **sandbox** | Host FS → Docker bind-mount | ✓ | Per-agent working directory + execution environment |
-| 4 | **users** | Filesystem | ✓ | User profiles, preferences, progressive persona |
-| 5 | **proc** | In-memory call slots | ✗ | Tool registry + call sessions |
-| 6 | **proc-store** | Filesystem + git clone | ✓ | External tool declarations & code distribution |
-| 7 | **services** | In-memory (restored from svc-store at boot) | ✗ | Active service registry |
-| 8 | **svc-store** | Filesystem | ✓ | Service artifacts (compose.yaml, etc.) |
-| 9 | **devices** | In-memory driver registry | ✗ | Hardware/virtual device abstraction |
-| 10 | **tmp** | In-memory HashMap | ✗ | Ephemeral KV, lost on restart |
+```protobuf
+rpc Handshake(HandshakeReq)         returns (HandshakeRes);
+rpc RegisterToken(RegisterTokenReq) returns (RegisterTokenRes);
+rpc RevokeToken(RevokeTokenReq)     returns (RevokeTokenRes);
+```
 
-## 3. Path × Operation Matrix
+Flow: runtime calls `RegisterToken(token, task_id, agent_config_id, role)` → launches agent with token in env → agent connects to UDS, sends `Handshake(token)` → kernel binds connection to task, returns session key in `x-logos-session` header → all subsequent calls are scoped to that task.
 
-### 3.1 memory
+Roles: `user` (read-only on system/services/devices) or `admin` (full access). Connections without a session header are treated as admin (for management use).
+
+## Namespaces
+
+| Namespace | Backend | Persistent | What it stores |
+|-----------|---------|:----------:|----------------|
+| `memory` | SQLite per group + FTS5 | yes | Messages, summaries (short/mid/long), knowledge graph |
+| `system` | SQLite | yes | Tasks, anchors, search index |
+| `sandbox` | Host FS, containerd + overlayfs | yes | Per-task working directories, execution logs |
+| `users` | Filesystem | yes | User profiles, persona (short/mid/long.md) |
+| `proc` | In-memory | no | Tool registry + per-call session slots |
+| `proc-store` | Filesystem + git | yes | External tool declarations and code |
+| `services` | In-memory (restored from svc-store) | no | Running service registry |
+| `svc-store` | Filesystem | yes | Service artifacts (compose.yaml, binaries) |
+| `devices` | In-memory | no | Hardware/virtual device drivers |
+| `tmp` | In-memory HashMap | no | Ephemeral KV |
+
+## Path Reference
+
+### memory
 
 | Path | Read | Write | Patch |
 |------|------|-------|-------|
-| `groups/{gid}/messages` | "null" | **Insert** message (ts/speaker/text/mentions) | — |
-| `groups/{gid}/messages/{id}` | Single message JSON | — | — |
+| `groups/{gid}/messages` | — | Insert message JSON (`ts`, `speaker`, `text`, `mentions`, `reply_to`) | — |
+| `groups/{gid}/messages/{id}` | Single message | — | — |
 | `groups/{gid}/summary/{layer}/latest` | Latest summary | — | — |
-| `groups/{gid}/summary/{layer}/{period}` | Summary for period | Write/overwrite | **deep merge** |
-| `groups/{gid}/graph/` | List all entities | — | — |
-| `groups/{gid}/graph/{entity_id}` | Entity details + relations | Write/upsert entity + relations | Upsert |
-| `groups/{gid}/graph/{entity_id}/relations` | Just relations | — | — |
-| `groups/{gid}/views/{name}` | Query view | — | — |
-| `plugins/` | List mounted view plugins (name + docs) | — | — |
+| `groups/{gid}/summary/{layer}/{period}` | Summary for period | Write/overwrite | Deep merge |
+| `groups/{gid}/graph/` | List all subjects | — | — |
+| `groups/{gid}/graph/{subject}` | All triples for subject | Write/upsert triples | Delegates to write |
+| `groups/{gid}/views/{name}` | Query view (params as JSON) | — | — |
+| `plugins/` | List mounted plugins with docs | — | — |
 
-> layer = short (hourly) / mid (daily) / long (monthly); period = ISO8601 (`2026-03-20T10` / `2026-03-20` / `2026-03`)
->
-> Memory views are pluggable modules (RFC 003 §11). `summary/` and `graph/` are the default plugins. Discover via `logos://memory/plugins/`.
+`layer` = `short` (hourly) / `mid` (daily) / `long` (monthly). `period` = ISO 8601 prefix.
 
-### 3.2 system
+Plugins: `summary` and `graph` are mounted by default. Each exposes its own URI structure. Discover available plugins via `logos://memory/plugins/`.
+
+### system
 
 | Path | Read | Write | Patch |
 |------|------|-------|-------|
-| `tasks` | List non-pending tasks | Create task | — |
-| `tasks/{id}` | Task details | — | — |
+| `tasks` | List all non-pending tasks | Create task (JSON with `task_id`, `description`, `chat_id`, etc.) | — |
+| `tasks/{id}` | Task JSON (includes `plan_todo`, `plan_parent`) | — | Deep merge |
 | `tasks/{id}/description` | — | Update description | — |
 | `anchors/{task_id}` | All anchors for task | — | — |
 | `anchors/{task_id}/{anchor_id}` | Single anchor | — | — |
 
-> State machine: `pending → active ⇄ sleep → finished`
+Task states: `pending → active ⇄ sleep → finished`. Pending tasks are never visible to agents. All state transitions go through `system.complete`, not direct writes.
 
-### 3.3 sandbox
+Task table columns: `task_id`, `description`, `workspace`, `resource`, `status`, `chat_id`, `trigger`, `plan_todo` (JSON string array), `plan_parent` (planner task ID), `created_at`, `updated_at`.
+
+### sandbox
+
+| Path | Read | Write |
+|------|------|-------|
+| `{task_id}/...` | File content or directory listing | Write file (creates parents) |
+| `{task_id}/log` | Read log | Append (via `system.complete`) |
+| `__system__/proc/{name}/` | Tool code | — |
+| `__system__/svc/{name}/` | Service artifacts | — |
+
+Containers are keyed by `agent_config_id`, not `task_id` — multiple tasks from the same agent share one container. URI `logos://sandbox/{task_id}/...` maps to `/workspace/...` inside the container.
+
+### users
 
 | Path | Read | Write | Patch |
 |------|------|-------|-------|
-| `{task_id}/...` | File content / directory listing | Write file (auto-creates parents) | Overwrite |
-| `{task_id}/log` | Read log | — | **Append** (newline-delimited) |
-| `__system__/proc/{name}/` | Tool code directory | — | — |
-| `__system__/svc/{name}/` | Service artifact directory | — | — |
-
-> Containers are keyed by agent_config_id (not task_id). Multiple tasks from the same agent share one container.
-> URI translation: `logos://sandbox/{task_id}/...` → `/workspace/...`
-
-### 3.4 users
-
-| Path | Read | Write | Patch |
-|------|------|-------|-------|
-| `{uid}/...` | File / directory listing | Write file | **deep merge** JSON |
-| `{uid}/persona/short/{period}` | Read | **Append** JSON array entry | — |
+| `{uid}/...` | File or directory listing | Write file | Deep merge JSON |
+| `{uid}/persona/short/{period}` | Read | **Append** to JSON array | — |
 | `{uid}/persona/mid/` | Read | Overwrite | — |
 | `{uid}/persona/long.md` | Read | Overwrite | — |
 
-### 3.5 proc
+`persona/short` is append-only — each write adds one entry to the array. Corrupted files are rejected (not silently cleared).
+
+### proc
 
 | Path | Read | Write |
 |------|------|-------|
 | `/` | List all tool names | — |
 | `{tool}` or `{tool}/.schema` | Tool schema JSON | — |
-| `{tool}/{call_id}/input` | Read back params | **Submit params → trigger synchronous execution** |
-| `{tool}/{call_id}/output` | Get result (**slot cleared after read**) | — |
-| `{tool}/{call_id}/error` | Error / "null" | — |
+| `{tool}/{call_id}/input` | Read back params | Submit params → trigger execution |
+| `{tool}/{call_id}/output` | Get result (slot cleared after read) | — |
+| `{tool}/{call_id}/error` | Error or "null" | — |
 
-### 3.6 proc-store
+In practice, agents use `logos_call(tool, params)` which handles the call_id lifecycle internally.
 
-| Path | Read | Write |
-|------|------|-------|
-| `/` | List tool names | — |
-| `{tool}/schema.json` | Tool declaration | **Register tool** (with `run` cmd, optional `git`) |
-| `{tool}/...` | Other files | Write file |
+### proc-store, services, svc-store, devices, tmp
 
-> If `git` field present → `git clone` to `sandbox/__system__/proc/{tool}/` at boot, `git pull --ff-only` if already cloned
+See the [Path Reference tables in README.zh.md](./README.zh.md) for full details. Key points:
 
-### 3.7 services
+- **proc-store**: external tool declarations. If `git` field present, kernel clones the repo to sandbox at boot.
+- **services**: runtime service registry. `ServiceEntry` = name, source, svc_type (oneshot/daemon), endpoint, status.
+- **svc-store**: persistent service artifacts (compose.yaml). Restored to services registry on boot.
+- **devices**: driver-based. Currently ships with a macOS system driver (volume, screenshot, dark mode).
+- **tmp**: ephemeral key-value. Lost on restart.
 
-| Path | Read | Write | Patch |
-|------|------|-------|-------|
-| `/` | List service names | — | — |
-| `{name}` | ServiceEntry JSON | Register/update | **deep merge** |
+## Built-in Proc Tools
 
-> ServiceEntry: name, source (builtin/agent), svc_type (oneshot/daemon), endpoint, status
+These are registered at boot and invoked via `logos_call`.
 
-### 3.8 svc-store
+### system.complete
 
-| Path | Read | Write |
-|------|------|-------|
-| `/` | List service names | — |
-| `{name}/compose.yaml` | Service manifest | Write |
-| `{name}/artifacts/...` | Build artifacts | Write |
+The turn terminator. Every agent turn must end with this call.
 
-### 3.9 devices
+```json
+{
+  "task_id": "task-001",
+  "summary": "what happened this turn",
+  "reply": "message to deliver to user (optional)",
+  "anchor": true,
+  "anchor_facts": "[{\"type\":\"decision\",\"topic\":\"font\",\"value\":\"宋体\"}]",
+  "task_log": "execution details to append to sandbox/log",
+  "sleep_reason": "awaiting_user (optional — task sleeps instead of finishing)",
+  "sleep_retry": false,
+  "resume": "task-042 (optional — abandon current task, activate this one)",
+  "plan": {
+    "todo": ["step 1 description", "step 2 description", "step 3 description"]
+  }
+}
+```
 
-| Path | Read | Write |
-|------|------|-------|
-| `/` | List device names | — |
-| `{name}` or `{name}/capabilities` | Capabilities JSON | — |
-| `{name}/state` | `{volume, muted, dark_mode, battery_percent, battery_charging}` | — |
-| `{name}/control` | — | Send command: `set_volume`/`mute`/`unmute`/`screenshot`/`dark_mode` |
+Three mutually exclusive paths:
 
-### 3.10 tmp
+1. **Finish** (default): task → `finished`. If `anchor: true`, creates an anchor checkpoint.
+2. **Sleep**: if `sleep_reason` is set, task → `sleep`.
+3. **Resume**: if `resume` is set, deletes current task, activates target task.
 
-| Path | Read | Write | Patch |
-|------|------|-------|-------|
-| `/` | List all keys | — | — |
-| `{key/path}` | Get value | Set value | Overwrite |
+**Plan mode**: if `plan.todo` is non-empty, task → `sleep` with the todo list stored. The scheduler picks up the first item, creates an executor task (`trigger: "plan"`, `plan_parent: "task-001"`), and waits for it to complete. When it does, the scheduler creates the next one. When all items are done (or the planner is woken up), the planner agent can submit a new todo, revise the plan, or finish.
 
-## 4. Built-in Proc Tools
+After execution, `task_log` is written to `logos://sandbox/{task_id}/log`.
 
-| Tool | Params | Function |
-|------|--------|----------|
-| `memory.search` | chat_id, query, limit | FTS5 full-text search |
-| `memory.range_fetch` | chat_id, ranges, limit, offset | Batch message range fetch |
-| `memory.view.by_speaker` | chat_id, speaker, limit | Filter by speaker |
-| `memory.view.recent` | chat_id, limit | Most recent N messages |
-| `system.search_tasks` | query, limit | Multi-level task + anchor search |
-| `system.get_context` | chat_id, sender_uid, msg_id? | Auto-inject session + summary + persona |
+### memory.search
 
-## 5. Kernel Subsystems
+```json
+{ "chat_id": "group-1", "query": "search terms", "limit": 10 }
+```
 
-| Subsystem | Storage | Purpose |
-|-----------|---------|---------|
-| **Token Registry** | In-memory (24h TTL) | One-time token → session binding; role = User / Admin; carries agent_config_id |
-| **Session Clustering** | In-memory L0/L1 + SQLite L2 | Reply-chain-based session clustering, 3-layer LRU eviction |
-| **Cron Scheduler** | In-memory job table | 60s tick, cron expression matching → create pending task |
-| **Consolidator** | 5 registered cron jobs | Progressive memory compression: messages → hourly → daily summaries; persona; knowledge graph |
-| **Context Injector** | Stateless | Assemble session + summary + persona before agent turn |
-| **VFS Middleware** | — | JsonValidator: validate JSON before writes to system/ and memory/ |
+FTS5 full-text search over messages. Max 50 results.
 
-### Consolidator Cron Jobs
+### memory.range_fetch
 
-| Job | Frequency | Action |
-|-----|-----------|--------|
-| `consolidate-short-summary` | Hourly :00 | Raw messages → short summary |
-| `consolidate-short-persona` | Hourly :05 | Raw messages → persona observations |
+```json
+{ "chat_id": "group-1", "ranges": [[100, 200], [300, 350]], "limit": 50, "offset": 0 }
+```
+
+Batch fetch messages by ID ranges. Max 200 per call.
+
+### system.search_tasks
+
+```json
+{ "query": "error snippet or keyword", "limit": 10 }
+```
+
+Two-level search: L1 = BM25 over anchor facts, L2 = keyword match on task descriptions. Returns `{ "l1_hits": [...], "l2_hits": [...] }`.
+
+### system.get_context
+
+```json
+{ "chat_id": "group-1", "sender_uid": "user-123", "msg_id": 456 }
+```
+
+Assembles turn context: current session, latest short summary, sender persona paths. Intended to be called by runtime before the agent's first token.
+
+## Session Clustering
+
+Three-layer LRU with topology-first design:
+
+| Layer | Storage | Trigger |
+|-------|---------|---------|
+| L0 | In-memory | Active sessions |
+| L1 | In-memory | LRU-evicted from L0 |
+| L2 | LanceDB (vector DB) | Evicted from L1, persisted with embeddings |
+
+Message routing:
+1. Has `reply_to`? → follow reply chain (hard binding). If target session is in L2, page-fault it back to L0.
+2. No reply chain? → semantic search in L2 via Ollama embeddings (soft binding, L2 distance < 0.5).
+3. No match? → create new session.
+
+Embeddings: Ollama `qwen3-embedding:0.6b`, 1024-dim. Configurable via `OLLAMA_URL`, `EMBED_MODEL`, `EMBED_DIM` env vars.
+
+If LanceDB init fails, kernel falls back to in-memory only (L0+L1) and prints a WARNING. Sessions will not be persisted across restarts in this mode.
+
+## Cron & Consolidator
+
+Scheduler ticks every 60s. Five consolidator jobs registered at boot:
+
+| Job | Schedule | Output |
+|-----|----------|--------|
+| `consolidate-short-summary` | Hourly :00 | Messages → short summary |
+| `consolidate-short-persona` | Hourly :05 | Messages → persona observations |
+| `consolidate-graph` | Hourly :10 | Messages → knowledge graph triples |
 | `consolidate-mid-summary` | Daily 03:00 | Short summaries → mid summary |
 | `consolidate-mid-persona` | Daily 03:30 | Short persona → rewrite mid persona |
-| `consolidate-graph` | Hourly :10 | Extract entities + relations → knowledge graph |
 
-### Session Clustering: 3-Layer LRU
+The scheduler also handles **plan dispatch**: scans for sleeping tasks with non-empty `plan_todo`, pops the head item, creates an executor task. One executor per planner at a time.
 
-| Layer | Storage | Purpose |
-|-------|---------|---------|
-| L0 | In-memory HashMap | Active sessions (recently replied to) |
-| L1 | In-memory HashMap | Inactive (LRU-evicted from L0) |
-| L2 | SQLite | Archived (persisted on L1 eviction, page-faulted back to L0 on reply) |
+## Access Control
 
-> Core principle: reply chains are hard bindings; semantic similarity is only a fallback.
+- **Sandbox isolation**: task owner can read/write own sandbox. Others can only read finished tasks' sandboxes.
+- **Namespace permissions**: `user` role is read-only on `services/`, `system/`, `devices/`.
+- **Exec/Call**: require a valid session.
+- **No session = admin**: management calls without `x-logos-session` header are treated as admin.
+- **JSON validation**: middleware validates JSON on writes/patches to `system/` and `memory/`.
 
-## 6. Access Control
-
-| Rule | Description |
-|------|-------------|
-| Sandbox isolation | Owner task can read/write own sandbox; non-owner can only read finished tasks' sandboxes |
-| Namespace permissions | User role cannot write to `services/`, `system/`, `devices/` |
-| Exec/Call auth | Exec and Call require a valid session (no anonymous execution) |
-| No session = Admin | Management interface calls (no header) on Read/Write/Patch treated as admin |
-| JSON validation | Writes/patches to `system/` and `memory/` must be valid JSON |
-
-## 7. MCP Adapter
-
-| MCP Tool | Maps to |
-|----------|---------|
-| `logos_read` | gRPC Read |
-| `logos_write` | gRPC Write |
-| `logos_patch` | gRPC Patch |
-| `logos_exec` | gRPC Exec |
-| `logos_call` | gRPC Call |
-
-## 8. Boot Sequence
+## Boot Sequence
 
 ```
-users → memory → system → tmp → sandbox (create)
-→ proc (built-in tools) → proc-store (restore external tools + git clone)
-→ services (restore from svc-store) → svc-store
-→ devices (macOS driver) → sandbox (mount) → table.open()
-→ cron.start() + consolidator registers 4 jobs
+1. users/
+2. memory/ (+ session store with optional LanceDB L2)
+3. system/ (SQLite)
+4. tmp/
+5. sandbox/ (containerd + overlayfs)
+6. proc/ (register built-in tools: memory.search, memory.range_fetch,
+          system.search_tasks, system.get_context, system.complete)
+7. proc-store/ (restore external tools, git clone/pull)
+8. services/ (restore from svc-store)
+9. svc-store/
+10. devices/
+11. sandbox/ (final mount)
+→ table.open() — kernel accepts connections
+→ cron.start() + 5 consolidator jobs registered
 ```
 
 ## Project Structure
 
 ```
 logos-fs/
-├── proto/logos.proto          # gRPC service definition (5 primitives + management)
+├── proto/logos.proto            # gRPC service (5 primitives + management)
 ├── crates/
-│   ├── logos-vfs/             # VFS core: Namespace trait, RoutingTable, URI parsing, Middleware
-│   ├── logos-kernel/          # Kernel: gRPC impl, namespace mounting, Token, Cron, Consolidator, Context
-│   ├── logos-mm/              # Memory module: message storage, summaries, views, FTS5
-│   ├── logos-system/          # System module: task state machine, anchors, search
-│   ├── logos-session/         # Session clustering: reply-chain topology, 3-layer LRU, SQLite L2
-│   └── logos-mcp/             # MCP adapter: gRPC → JSON-RPC 2.0 (5 tools)
+│   ├── logos-vfs/               # Namespace trait, RoutingTable, URI parsing, middleware
+│   ├── logos-kernel/            # gRPC server, namespace wiring, token, cron, consolidator,
+│   │                            # builtin tools, sandbox (containerd), context injection
+│   ├── logos-mm/                # Memory: messages, summaries, graph, FTS5, view plugins
+│   ├── logos-system/            # Tasks, anchors, search, logos_complete logic, plan storage
+│   ├── logos-session/           # Session clustering: reply-chain topology, 3-layer LRU,
+│   │                            # LanceDB L2 with Ollama embeddings
+│   └── logos-mcp/               # MCP adapter: stdio JSON-RPC ↔ gRPC UDS
+├── test.Dockerfile              # Debian slim build + test environment
+└── data/state/                  # Runtime data (SQLite DBs, sandbox root)
 ```
+
+## Environment Variables
+
+| Var | Default | Purpose |
+|-----|---------|---------|
+| `VFS_USERS_ROOT` | `../../data/state/entities` | Users namespace root |
+| `VFS_MEMORY_ROOT` | `../../data/state/memory` | Memory DB root |
+| `VFS_SYSTEM_DB` | `../../data/state/system.db` | System SQLite path |
+| `VFS_SANDBOX_ROOT` | `../../data/state/sandbox` | Sandbox root |
+| `VFS_PROC_STORE_ROOT` | `../../data/state/proc-store` | Proc-store root |
+| `VFS_SVC_STORE_ROOT` | `../../data/state/svc-store` | Svc-store root |
+| `VFS_LISTEN` | `unix://{sandbox_root}/logos.sock` | gRPC listen address |
+| `OLLAMA_URL` | `http://localhost:11434` | Ollama API for embeddings |
+| `EMBED_MODEL` | `qwen3-embedding:0.6b` | Embedding model name |
+| `EMBED_DIM` | `1024` | Embedding dimension |
+| `LOGOS_SOCKET` | `../../data/state/sandbox/logos.sock` | MCP adapter socket path |
+| `LOGOS_TOKEN` | (empty) | MCP adapter handshake token |
