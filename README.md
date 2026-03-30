@@ -97,7 +97,7 @@ Task table columns: `task_id`, `description`, `workspace`, `resource`, `status`,
 | `__system__/proc/{name}/` | Tool code | — |
 | `__system__/svc/{name}/` | Service artifacts | — |
 
-Containers are keyed by `agent_config_id`, not `task_id` — multiple tasks from the same agent share one container. URI `logos://sandbox/{task_id}/...` maps to `/workspace/...` inside the container.
+Containers are keyed by `agent_config_id`, not `task_id` — multiple tasks from the same agent share one container, but each task has its own subdirectory. URI `logos://sandbox/{task_id}/...` maps to `/workspace/{task_id}/...` inside the container. Relative paths (without `logos://` prefix) are auto-resolved to `logos://sandbox/{task_id}/...` based on the session — agents don't need to know their own task_id.
 
 ### users
 
@@ -189,7 +189,7 @@ Batch fetch messages by ID ranges. Max 200 per call.
 { "query": "error snippet or keyword", "limit": 10 }
 ```
 
-Two-level search: L1 = BM25 over anchor facts, L2 = keyword match on task descriptions. Returns `{ "l1_hits": [...], "l2_hits": [...] }`.
+Two-level search: L1 = BM25 over anchor facts (FTS5), L2 = BM25 over task descriptions (FTS5). Returns `{ "l1_hits": [...], "l2_hits": [...] }`.
 
 ### system.get_context
 

@@ -97,7 +97,7 @@ rpc RevokeToken(RevokeTokenReq)     returns (RevokeTokenRes);
 | `__system__/proc/{name}/` | 工具代码 | — |
 | `__system__/svc/{name}/` | 服务制品 | — |
 
-容器按 `agent_config_id` 建，同一 agent 的不同 task 共用一个容器。`logos://sandbox/{task_id}/...` → 容器内 `/workspace/...`。
+容器按 `agent_config_id` 建，同一 agent 的不同 task 共用一个容器，但每个 task 有独立的子目录。`logos://sandbox/{task_id}/...` → 容器内 `/workspace/{task_id}/...`。不带 `logos://` 前缀的相对路径会根据 session 自动补全为 `logos://sandbox/{task_id}/...`，agent 不需要知道自己的 task_id。
 
 ### users
 
@@ -222,7 +222,7 @@ FTS5 全文搜索。最多 50 条。
 { "query": "报错片段或关键词", "limit": 10 }
 ```
 
-两级搜索：L1 = 锚点 facts 的 BM25 匹配，L2 = 任务 description 关键词匹配。返回 `{ "l1_hits": [...], "l2_hits": [...] }`。
+两级搜索：L1 = 锚点 facts 的 BM25 匹配（FTS5），L2 = 任务 description 的 BM25 匹配（FTS5）。返回 `{ "l1_hits": [...], "l2_hits": [...] }`。
 
 ### system.get_context
 
