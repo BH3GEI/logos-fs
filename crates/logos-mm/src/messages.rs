@@ -70,10 +70,13 @@ impl MessageDb {
             .unwrap_or_else(|| "[]".to_string());
         let reply_to: Option<i64> = val["reply_to"].as_i64();
 
+        let user_msg_id: Option<i64> = val["msg_id"].as_i64();
+
         let result = sqlx::query(
-            "INSERT INTO messages (ts, chat_id, speaker, reply_to, text, mentions)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO messages (msg_id, ts, chat_id, speaker, reply_to, text, mentions)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )
+        .bind(user_msg_id)
         .bind(&ts)
         .bind(chat_id)
         .bind(&speaker)
@@ -84,7 +87,7 @@ impl MessageDb {
         .await
         .map_err(|e| VfsError::Sqlite(format!("insert: {e}")))?;
 
-        let msg_id = result.last_insert_rowid();
+        let msg_id = user_msg_id.unwrap_or(result.last_insert_rowid());
 
         // Sync FTS
         sqlx::query("INSERT INTO messages_fts(rowid, text) VALUES (?1, ?2)")
@@ -210,7 +213,7 @@ fn msg_row_to_json(row: &sqlx::sqlite::SqliteRow) -> serde_json::Value {
 async fn init_schema(pool: &SqlitePool) -> Result<(), VfsError> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS messages (
-            msg_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+            msg_id    INTEGER PRIMARY KEY,
             ts        TEXT NOT NULL,
             chat_id   TEXT NOT NULL,
             speaker   TEXT NOT NULL,

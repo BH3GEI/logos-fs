@@ -50,5 +50,9 @@ impl VfsMiddleware for JsonValidator {
 }
 
 fn needs_json_validation(uri: &str) -> bool {
+    // system/ and memory/ writes must be JSON, except for plain-text fields like description
+    if uri.ends_with("/description") {
+        return false;
+    }
     uri.starts_with("logos://system/") || uri.starts_with("logos://memory/")
 }

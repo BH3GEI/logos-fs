@@ -163,16 +163,20 @@ impl Namespace for SystemModule {
     async fn patch(&self, path: &[&str], partial: &str) -> Result<(), VfsError> {
         let resource = path.first().map(|s| *s).unwrap_or("");
 
-        // For tasks/{task_id}: read-merge-write
-        if resource == "tasks" && path.len() >= 2 && path.len() < 3 {
+        // For tasks/{task_id}: merge partial JSON into existing task
+        if resource == "tasks" && path.len() == 2 {
+            let task_id = path[1];
             let existing = self.read(path).await?;
             if let (Ok(mut base), Ok(patch)) = (
                 serde_json::from_str::<serde_json::Value>(&existing),
                 serde_json::from_str::<serde_json::Value>(partial),
             ) {
                 logos_vfs::json_deep_merge(&mut base, &patch);
-                let merged = serde_json::to_string(&base).unwrap_or_else(|_| partial.to_string());
-                return self.write(path, &merged).await;
+                // Update description if it changed
+                if let Some(desc) = base["description"].as_str() {
+                    self.tasks.update_description(task_id, desc).await?;
+                }
+                return Ok(());
             }
         }
 
