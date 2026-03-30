@@ -31,7 +31,6 @@ struct ServiceEntry {
 /// The kernel only maintains the registry. Actual service start/stop
 /// is the runtime's responsibility.
 pub struct ServicesNs {
-    #[allow(dead_code)] // used by runtime for reading compose.yaml at service start
     store_root: PathBuf,
     registry: Mutex<HashMap<String, ServiceEntry>>,
 }

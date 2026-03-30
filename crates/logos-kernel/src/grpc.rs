@@ -13,8 +13,6 @@ const SESSION_KEY_HEADER: &str = "x-logos-session";
 pub struct LogosService {
     table: Arc<RoutingTable>,
     system: Arc<logos_system::SystemModule>,
-    #[allow(dead_code)]
-    mm: Arc<logos_mm::MemoryModule>,
     sandbox: Arc<SandboxNs>,
     proc_ns: Arc<crate::proc::ProcNs>,
     tokens: Arc<TokenRegistry>,
@@ -24,7 +22,6 @@ impl LogosService {
     pub fn new(
         table: Arc<RoutingTable>,
         system: Arc<logos_system::SystemModule>,
-        mm: Arc<logos_mm::MemoryModule>,
         sandbox: Arc<SandboxNs>,
         proc_ns: Arc<crate::proc::ProcNs>,
         tokens: Arc<TokenRegistry>,
@@ -32,7 +29,6 @@ impl LogosService {
         Self {
             table,
             system,
-            mm,
             sandbox,
             proc_ns,
             tokens,
@@ -189,7 +185,12 @@ impl Logos for LogosService {
                     error: String::new(),
                 });
                 res.metadata_mut()
-                    .insert(SESSION_KEY_HEADER, session_key.parse().unwrap());
+                    .insert(
+                        SESSION_KEY_HEADER,
+                        session_key.parse().map_err(|_| {
+                            Status::internal("session key contains invalid characters")
+                        })?,
+                    );
                 Ok(res)
             }
             None => Ok(Response::new(HandshakeRes {

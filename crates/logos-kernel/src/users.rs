@@ -51,11 +51,15 @@ impl UsersNs {
             self.root.join(format!("{}/persona/short/latest", path[0]))
         };
 
-        let existing = tokio::fs::read_to_string(&file_path)
-            .await
-            .unwrap_or_else(|_| "[]".to_string());
-        let mut entries: Vec<serde_json::Value> =
-            serde_json::from_str(&existing).unwrap_or_default();
+        let existing = match tokio::fs::read_to_string(&file_path).await {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => "[]".to_string(),
+            Err(e) => return Err(VfsError::Io(format!("read {}: {e}", file_path.display()))),
+        };
+        let mut entries: Vec<serde_json::Value> = serde_json::from_str(&existing)
+            .map_err(|e| VfsError::InvalidJson(format!(
+                "corrupt persona/short at {}: {e}", file_path.display()
+            )))?;
         let new_entry: serde_json::Value = serde_json::from_str(content)
             .unwrap_or(serde_json::Value::String(content.to_string()));
         entries.push(new_entry);

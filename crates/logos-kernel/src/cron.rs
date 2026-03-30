@@ -60,6 +60,7 @@ impl CronScheduler {
     }
 
     /// Check all jobs and fire those whose cron expression matches now.
+    /// Also checks for plan tasks that need scheduling.
     async fn tick(&self) {
         let now = chrono::Utc::now();
         let job_names: Vec<String> = {
@@ -79,9 +80,45 @@ impl CronScheduler {
 
         for name in job_names {
             if let Err(e) = self.fire(&name).await {
-                eprintln!("[logos-cron] failed to fire {name}: {e}");
+                eprintln!("[logos-cron] ERROR: failed to fire {name}: {e}");
             }
         }
+
+        // Plan scheduling: pick up sleeping tasks with non-empty plan_todo
+        if let Err(e) = self.tick_plans().await {
+            eprintln!("[logos-plan] ERROR: plan tick failed: {e}");
+        }
+    }
+
+    /// Process plan tasks: for each sleeping task with plan_todo, pop the head
+    /// and create an executor task.
+    async fn tick_plans(&self) -> Result<(), VfsError> {
+        let pending = self.system.list_plan_pending().await?;
+        for (planner_id, _todo_json) in pending {
+            // Skip if executor already running for this planner
+            if self.system.has_active_executor(&planner_id).await.unwrap_or(false) {
+                continue;
+            }
+
+            // Pop head from todo
+            let Some(description) = self.system.pop_plan_head(&planner_id).await? else {
+                continue;
+            };
+
+            // Create executor task
+            let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S").to_string();
+            let executor_id = format!("plan-exec-{planner_id}-{ts}");
+            let task_content = serde_json::json!({
+                "task_id": executor_id,
+                "description": description,
+                "chat_id": "",
+                "trigger": "plan",
+                "plan_parent": planner_id,
+            });
+            self.system.create_task(&task_content.to_string()).await?;
+            println!("[logos-plan] created executor task {executor_id} for planner {planner_id}");
+        }
+        Ok(())
     }
 
     /// Create a task from a cron job template.

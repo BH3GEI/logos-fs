@@ -14,12 +14,19 @@ pub struct CompleteParams {
     pub sleep_reason: String,
     pub sleep_retry: bool,
     pub resume_task_id: String,
+    /// Plan mode: list of subtask descriptions. When non-empty, current task
+    /// sleeps and scheduler will create executor tasks from this list.
+    pub plan_todo: Vec<String>,
 }
 
 /// Result of logos_complete.
 pub struct CompleteResult {
     pub reply: String,
     pub anchor_id: String,
+    /// Caller is responsible for writing this to `logos://sandbox/{task_id}/log`.
+    pub task_log: String,
+    /// The task_id (needed by caller to construct the log URI).
+    pub task_id: String,
 }
 
 /// Execute logos_complete atomically:
@@ -39,6 +46,35 @@ pub async fn execute(
         return Ok(CompleteResult {
             reply: params.reply,
             anchor_id: String::new(),
+            task_log: params.task_log,
+            task_id: params.resume_task_id,
+        });
+    }
+
+    // Plan mode: store todo and sleep, scheduler will handle the rest
+    if !params.plan_todo.is_empty() && !params.task_id.is_empty() {
+        let todo_json = serde_json::to_string(&params.plan_todo)
+            .unwrap_or_else(|_| "[]".into());
+        TaskDb::set_plan_todo(&tasks.pool, &params.task_id, &todo_json).await?;
+        TaskDb::transition_status(&tasks.pool, &params.task_id, "sleep").await?;
+
+        // Anchor if requested (planner may want to checkpoint)
+        let mut anchor_id = String::new();
+        if params.anchor && !params.task_id.is_empty() {
+            anchor_id = AnchorDb::create(
+                &tasks.pool,
+                &params.task_id,
+                &params.summary,
+                &params.anchor_facts,
+            )
+            .await?;
+        }
+
+        return Ok(CompleteResult {
+            reply: params.reply,
+            anchor_id,
+            task_log: params.task_log,
+            task_id: params.task_id,
         });
     }
 
@@ -78,11 +114,15 @@ pub async fn execute(
             "chat_id": "",
             "trigger": "anchor",
         });
-        let _ = tasks.create(&regen_content.to_string()).await;
+        if let Err(e) = tasks.create(&regen_content.to_string()).await {
+            eprintln!("[logos] ERROR: regen-summary task creation failed: {e}");
+        }
     }
 
     Ok(CompleteResult {
         reply: params.reply,
         anchor_id,
+        task_log: params.task_log,
+        task_id: params.task_id,
     })
 }

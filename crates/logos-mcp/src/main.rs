@@ -120,7 +120,8 @@ fn tool_definitions() -> serde_json::Value {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let socket_path = std::env::var("LOGOS_SOCKET")
-        .unwrap_or_else(|_| "/tmp/logos-sandbox/logos.sock".to_string());
+        // Default must match kernel's VFS_LISTEN default (sandbox_root + /logos.sock)
+        .unwrap_or_else(|_| "../../data/state/sandbox/logos.sock".to_string());
     let token = std::env::var("LOGOS_TOKEN").unwrap_or_default();
 
     // Connect to kernel gRPC via UDS

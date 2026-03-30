@@ -80,9 +80,12 @@ impl ProcStoreNs {
                     }
                 } else {
                     // Pull latest
-                    let _ = sandbox
+                    if let Err(e) = sandbox
                         .exec(&format!("cd {sandbox_path} && git pull --ff-only"), "__system__")
-                        .await;
+                        .await
+                    {
+                        eprintln!("[logos] WARNING: git pull failed for {tool_name}: {e}");
+                    }
                 }
             }
 

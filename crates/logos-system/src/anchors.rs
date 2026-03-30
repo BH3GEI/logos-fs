@@ -119,7 +119,7 @@ impl AnchorDb {
         // Parse URI: logos://system/anchors/{task_id}/{anchor_id}
         let parts: Vec<&str> = target_uri.split('/').collect();
         // ["logos:", "", "system", "anchors", task_id, anchor_id]
-        if parts.len() < 6 || parts[3] != "anchors" {
+        if parts.len() != 6 || parts[3] != "anchors" {
             return Err(VfsError::InvalidPath(format!(
                 "invalid anchor URI: {target_uri}"
             )));

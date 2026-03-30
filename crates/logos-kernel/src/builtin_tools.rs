@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use logos_vfs::VfsError;
 
 use crate::proc::ProcTool;
+use crate::sandbox::SandboxNs;
 
 /// memory.search — FTS full-text search (RFC 003 §3.2)
 pub struct MemorySearchTool {
@@ -162,5 +163,97 @@ impl ProcTool for SystemGetContextTool {
             }
         });
         Ok(context.to_string())
+    }
+}
+
+/// system.complete — turn terminator (RFC 002 §9.1)
+///
+/// Finishes, sleeps, or resumes a task. Optionally creates an anchor,
+/// writes task_log to sandbox, and/or submits a plan for scheduler pickup.
+pub struct SystemCompleteTool {
+    pub system: Arc<logos_system::SystemModule>,
+    pub sandbox: Arc<SandboxNs>,
+}
+
+#[async_trait]
+impl ProcTool for SystemCompleteTool {
+    fn name(&self) -> &str {
+        "system.complete"
+    }
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "name": "system.complete",
+            "description": "Turn terminator. Finishes/sleeps/resumes a task. The mandatory final call of every agent turn.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string", "description": "Current task ID" },
+                    "summary": { "type": "string", "description": "What happened this turn" },
+                    "reply": { "type": "string", "description": "Message to deliver to the user (optional)" },
+                    "anchor": { "type": "boolean", "description": "Create a completion anchor", "default": false },
+                    "anchor_facts": { "type": "string", "description": "JSON array of fact objects for the anchor" },
+                    "task_log": { "type": "string", "description": "Execution log to append to sandbox" },
+                    "sleep_reason": { "type": "string", "description": "If set, task sleeps instead of finishing" },
+                    "sleep_retry": { "type": "boolean", "description": "Hint: adapter should auto-retry", "default": false },
+                    "resume": { "type": "string", "description": "Task ID to resume (abandons current task)" },
+                    "plan": {
+                        "type": "object",
+                        "description": "Plan mode: submit subtasks for scheduler",
+                        "properties": {
+                            "todo": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Ordered list of subtask descriptions"
+                            }
+                        }
+                    }
+                },
+                "required": ["task_id", "summary"]
+            }
+        })
+    }
+    async fn call(&self, params: &str) -> Result<String, VfsError> {
+        let val: serde_json::Value =
+            serde_json::from_str(params).map_err(|e| VfsError::InvalidJson(e.to_string()))?;
+
+        let plan_todo: Vec<String> = val["plan"]["todo"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let complete_params = logos_system::CompleteParams {
+            task_id: val["task_id"].as_str().unwrap_or_default().to_string(),
+            summary: val["summary"].as_str().unwrap_or_default().to_string(),
+            reply: val["reply"].as_str().unwrap_or_default().to_string(),
+            anchor: val["anchor"].as_bool().unwrap_or(false),
+            anchor_facts: val["anchor_facts"].as_str().unwrap_or("[]").to_string(),
+            task_log: val["task_log"].as_str().unwrap_or_default().to_string(),
+            sleep_reason: val["sleep_reason"].as_str().unwrap_or_default().to_string(),
+            sleep_retry: val["sleep_retry"].as_bool().unwrap_or(false),
+            resume_task_id: val["resume"].as_str().unwrap_or_default().to_string(),
+            plan_todo,
+        };
+
+        let result = self.system.complete(complete_params).await?;
+
+        // Write task_log to sandbox (RFC 002 §9.1)
+        if !result.task_log.is_empty() && !result.task_id.is_empty() {
+            let log_path = format!("{}/log", result.task_id);
+            use logos_vfs::Namespace;
+            if let Err(e) = self.sandbox.write(&[&log_path], &result.task_log).await {
+                eprintln!("[logos] WARNING: failed to write task_log to sandbox: {e}");
+            }
+        }
+
+        Ok(serde_json::json!({
+            "reply": result.reply,
+            "anchor_id": result.anchor_id,
+            "task_id": result.task_id,
+        })
+        .to_string())
     }
 }

@@ -46,15 +46,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 2. memory/
     let memory_root = env_path("VFS_MEMORY_ROOT", "../../data/state/memory");
-    let session_db = memory_root.join("sessions.db");
-    let sessions = Arc::new(
-        logos_mm::SessionStore::with_sqlite(session_db, 64, 256)
-            .await
-            .unwrap_or_else(|e| {
-                eprintln!("[logos] session db init failed ({e}), using in-memory only");
-                logos_mm::SessionStore::new(64, 256)
-            })
-    );
+    let session_lance = memory_root.join("sessions.lance");
+    let ollama_url = std::env::var("OLLAMA_URL").unwrap_or_else(|_| "http://localhost:11434".into());
+    let embed_model = std::env::var("EMBED_MODEL").unwrap_or_else(|_| "qwen3-embedding:0.6b".into());
+    let embed_dim: i32 = std::env::var("EMBED_DIM").ok().and_then(|v| v.parse().ok()).unwrap_or(1024);
+    let (sessions, l2_disabled) = match logos_mm::SessionStore::with_lancedb(
+        &session_lance, &ollama_url, &embed_model, embed_dim, 64, 256,
+    ).await {
+        Ok(s) => (Arc::new(s), false),
+        Err(e) => {
+            eprintln!("[logos] WARNING: session L2 init failed ({e}), falling back to in-memory only");
+            (Arc::new(logos_mm::SessionStore::new(64, 256)), true)
+        }
+    };
     let memory_ns = logos_mm::MemoryModule::init(memory_root, Arc::clone(&sessions))?;
     let mm_arc = Arc::new(memory_ns);
     table.mount(Box::new(MemoryNsRef(Arc::clone(&mm_arc))));
@@ -93,6 +97,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     proc_ns.register(Arc::new(builtin_tools::SystemGetContextTool {
         mm: Arc::clone(&mm_arc),
         sessions: Arc::clone(&sessions),
+    }));
+    proc_ns.register(Arc::new(builtin_tools::SystemCompleteTool {
+        system: Arc::clone(&system_arc),
+        sandbox: Arc::clone(&sandbox_arc),
     }));
 
     // 7. proc-store/ — persistent proc tool declarations
@@ -137,6 +145,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "[logos] kernel ready — {} namespace(s) mounted",
         table.mounted().len()
     );
+    if l2_disabled {
+        eprintln!("[logos] WARNING: session L2 disabled — sessions are NOT persisted across restarts");
+    }
 
     // --- Consolidator cron jobs (RFC 003 §4) ---
     let scheduler = Arc::new(cron::CronScheduler::new(Arc::clone(&system_arc)));
@@ -149,7 +160,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let service = grpc::LogosService::new(
         Arc::clone(&table),
         system_arc,
-        mm_arc,
         sandbox_arc,
         proc_arc,
         tokens,

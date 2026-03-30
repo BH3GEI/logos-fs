@@ -1,14 +1,15 @@
 //! Consolidator — RFC 003 §4 Memory Consolidation.
 //!
-//! Registers 4 cron jobs that create tasks for agent execution:
+//! Registers 5 cron jobs that create tasks for agent execution:
 //! - consolidate-short-summary (hourly): raw messages → short summary
 //! - consolidate-short-persona (hourly): raw messages → persona observations
+//! - consolidate-graph (hourly): extract knowledge triples
 //! - consolidate-mid-summary (daily): short summaries → mid summary
 //! - consolidate-mid-persona (daily): short persona → rewrite mid persona
 
 use crate::cron::{CronJob, CronScheduler};
 
-/// Register all 4 consolidator cron jobs.
+/// Register all 5 consolidator cron jobs.
 ///
 /// `chat_ids` should be scanned from the memory db_root directory.
 pub async fn register_consolidator_jobs(scheduler: &CronScheduler) {

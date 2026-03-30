@@ -54,19 +54,10 @@ impl SandboxNs {
         std::fs::create_dir_all(&host_root)
             .map_err(|e| VfsError::Io(format!("create sandbox dir: {e}")))?;
 
-        // Try containerd first, fall back to Docker
-        let executor: Box<dyn SandboxExecutor> = match ContainerdExecutor::try_init(image.clone()).await {
-            Ok(e) => {
-                println!("[logos] sandbox: using containerd");
-                Box::new(e)
-            }
-            Err(e) => {
-                println!("[logos] sandbox: containerd unavailable ({e}), trying docker...");
-                let docker = DockerExecutor::try_init(image).await?;
-                println!("[logos] sandbox: using docker");
-                Box::new(docker)
-            }
-        };
+        let executor: Box<dyn SandboxExecutor> = Box::new(
+            ContainerdExecutor::try_init(image).await?
+        );
+        println!("[logos] sandbox: using containerd");
 
         Ok(Self {
             executor,
@@ -259,7 +250,7 @@ impl ContainerdExecutor {
                     let mut vc = ctrd::services::v1::version_client::VersionClient::new(channel.clone());
                     match vc.version(()).await {
                         Ok(_) => {
-                            let image = image.unwrap_or_else(|| "docker.io/library/alpine:latest".to_string());
+                            let image = image.unwrap_or_else(|| "docker.io/library/debian:stable-slim".to_string());
                             return Ok(Self { channel, image });
                         }
                         Err(e) => last_err = format!("version check failed on {path}: {e}"),
@@ -727,161 +718,7 @@ impl SandboxExecutor for ContainerdExecutor {
     }
 }
 
-// =============================================================================
-// Docker executor (fallback)
-// =============================================================================
-
-use bollard::Docker;
-use bollard::exec::{CreateExecOptions, StartExecResults};
-#[allow(deprecated)]
-use bollard::container::{Config, CreateContainerOptions, StartContainerOptions};
-#[allow(deprecated)]
-use bollard::image::CreateImageOptions;
-use futures_util::StreamExt;
-
-struct DockerExecutor {
-    docker: Docker,
-    image: String,
-}
-
-impl DockerExecutor {
-    async fn try_init(image: Option<String>) -> Result<Self, VfsError> {
-        let docker = connect_docker().await?;
-        docker.ping().await
-            .map_err(|e| VfsError::Io(format!("docker ping: {e}")))?;
-
-        let image = image.unwrap_or_else(|| "ubuntu:24.04".to_string());
-        ensure_docker_image(&docker, &image).await?;
-
-        Ok(Self { docker, image })
-    }
-}
-
-#[async_trait]
-impl SandboxExecutor for DockerExecutor {
-    async fn ensure_container(&self, agent_config_id: &str, sock_path: Option<&PathBuf>) -> Result<ContainerInfo, VfsError> {
-        let container_name = format!("logos-sandbox-{agent_config_id}");
-        // Docker uses bind-mount, so host_dir is under host_root
-        let host_dir = PathBuf::from(
-            std::env::var("VFS_SANDBOX_ROOT").unwrap_or_else(|_| "/tmp/logos-sandbox".to_string())
-        ).join(agent_config_id);
-        std::fs::create_dir_all(&host_dir)
-            .map_err(|e| VfsError::Io(format!("create docker agent dir: {e}")))?;
-
-        #[allow(deprecated)]
-        let container_id = match self.docker
-            .inspect_container(&container_name, None::<bollard::container::InspectContainerOptions>)
-            .await
-        {
-            Ok(info) => {
-                let id = info.id.unwrap_or_default();
-                if let Some(state) = &info.state {
-                    if state.running != Some(true) {
-                        self.docker
-                            .start_container(&id, None::<StartContainerOptions<String>>)
-                            .await
-                            .map_err(|e| VfsError::Io(format!("start container: {e}")))?;
-                    }
-                }
-                id
-            }
-            Err(_) => {
-                let host_path = host_dir.canonicalize()
-                    .unwrap_or(host_dir.clone())
-                    .to_string_lossy()
-                    .to_string();
-
-                let mut binds = vec![format!("{host_path}:{CONTAINER_WORKDIR}")];
-                if let Some(sock) = sock_path {
-                    let sock_host = sock.canonicalize()
-                        .unwrap_or(sock.clone())
-                        .to_string_lossy()
-                        .to_string();
-                    binds.push(format!("{sock_host}:/logos.sock"));
-                }
-
-                let config = Config {
-                    image: Some(self.image.clone()),
-                    cmd: Some(vec!["tail".to_string(), "-f".to_string(), "/dev/null".to_string()]),
-                    working_dir: Some(CONTAINER_WORKDIR.to_string()),
-                    host_config: Some(bollard::models::HostConfig {
-                        binds: Some(binds),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                };
-
-                let resp = self.docker
-                    .create_container(
-                        Some(CreateContainerOptions {
-                            name: &container_name,
-                            platform: None,
-                        }),
-                        config,
-                    )
-                    .await
-                    .map_err(|e| VfsError::Io(format!("create container: {e}")))?;
-
-                self.docker
-                    .start_container(&resp.id, None::<StartContainerOptions<String>>)
-                    .await
-                    .map_err(|e| VfsError::Io(format!("start container: {e}")))?;
-
-                resp.id
-            }
-        };
-
-        Ok(ContainerInfo { container_id, host_path: host_dir })
-    }
-
-    async fn exec_in_container(&self, container_id: &str, command: &str) -> Result<ExecResult, VfsError> {
-        let exec_config = CreateExecOptions {
-            cmd: Some(vec!["sh", "-c", command]),
-            attach_stdout: Some(true),
-            attach_stderr: Some(true),
-            working_dir: Some(CONTAINER_WORKDIR),
-            ..Default::default()
-        };
-
-        let exec = self.docker.create_exec(container_id, exec_config).await
-            .map_err(|e| VfsError::Io(format!("create exec: {e}")))?;
-
-        let output = self.docker.start_exec(&exec.id, None).await
-            .map_err(|e| VfsError::Io(format!("start exec: {e}")))?;
-
-        let mut stdout = String::new();
-        let mut stderr = String::new();
-
-        if let StartExecResults::Attached { mut output, .. } = output {
-            while let Some(Ok(msg)) = output.next().await {
-                match msg {
-                    bollard::container::LogOutput::StdOut { message } => {
-                        stdout.push_str(&String::from_utf8_lossy(&message));
-                    }
-                    bollard::container::LogOutput::StdErr { message } => {
-                        stderr.push_str(&String::from_utf8_lossy(&message));
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        let inspect = self.docker.inspect_exec(&exec.id).await
-            .map_err(|e| VfsError::Io(format!("inspect exec: {e}")))?;
-        let exit_code = inspect.exit_code.unwrap_or(-1) as i32;
-
-        Ok(ExecResult { stdout, stderr, exit_code })
-    }
-
-    async fn remove_container(&self, container_id: &str) -> Result<(), VfsError> {
-        let _ = self.docker.stop_container(container_id, None::<bollard::query_parameters::StopContainerOptions>).await;
-        let _ = self.docker.remove_container(container_id, None::<bollard::query_parameters::RemoveContainerOptions>).await;
-        Ok(())
-    }
-}
-
 /// Create a FIFO (named pipe) at the given path. Required by containerd for stdio.
-#[cfg(unix)]
 fn create_fifo(path: &std::path::Path) -> Result<(), VfsError> {
     let _ = std::fs::remove_file(path);
     let c_path = std::ffi::CString::new(path.to_string_lossy().as_bytes())
@@ -894,55 +731,6 @@ fn create_fifo(path: &std::path::Path) -> Result<(), VfsError> {
             std::io::Error::last_os_error()
         )));
     }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn create_fifo(path: &std::path::Path) -> Result<(), VfsError> {
-    // FIFOs not supported on non-Unix; create regular file as fallback (Docker mode)
-    std::fs::write(path, "").map_err(|e| VfsError::Io(format!("create file {}: {e}", path.display())))
-}
-
-async fn connect_docker() -> Result<Docker, VfsError> {
-    if let Ok(host) = std::env::var("DOCKER_HOST") {
-        if let Some(path) = host.strip_prefix("unix://") {
-            if std::path::Path::new(path).exists() {
-                return Docker::connect_with_unix(path, 120, bollard::API_DEFAULT_VERSION)
-                    .map_err(|e| VfsError::Io(format!("docker connect {host}: {e}")));
-            }
-        }
-    }
-
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    let colima_sock = format!("{home}/.colima/default/docker.sock");
-    if std::path::Path::new(&colima_sock).exists() {
-        return Docker::connect_with_unix(&colima_sock, 120, bollard::API_DEFAULT_VERSION)
-            .map_err(|e| VfsError::Io(format!("docker connect colima: {e}")));
-    }
-
-    let std_sock = "/var/run/docker.sock";
-    if std::path::Path::new(std_sock).exists() {
-        return Docker::connect_with_unix(std_sock, 120, bollard::API_DEFAULT_VERSION)
-            .map_err(|e| VfsError::Io(format!("docker connect standard: {e}")));
-    }
-
-    Err(VfsError::Io("no docker socket found".to_string()))
-}
-
-async fn ensure_docker_image(docker: &Docker, image: &str) -> Result<(), VfsError> {
-    if docker.inspect_image(image).await.is_ok() {
-        return Ok(());
-    }
-
-    println!("[logos] pulling image {image}...");
-    let mut stream = docker.create_image(
-        Some(CreateImageOptions { from_image: image, ..Default::default() }),
-        None, None,
-    );
-    while let Some(result) = stream.next().await {
-        result.map_err(|e| VfsError::Io(format!("pull image {image}: {e}")))?;
-    }
-    println!("[logos] image {image} ready");
     Ok(())
 }
 

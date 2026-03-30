@@ -3,6 +3,8 @@ pub mod complete;
 pub mod search;
 pub mod tasks;
 
+pub use complete::{CompleteParams, CompleteResult};
+
 use std::path::PathBuf;
 
 use async_trait::async_trait;
@@ -62,6 +64,30 @@ impl SystemModule {
     /// Search tasks and anchors — RFC 003 §6.2 multi-level experience retrieval.
     pub async fn search_tasks(&self, query: &str, limit: i64) -> Result<String, VfsError> {
         search::search_tasks(&self.tasks.pool, query, limit).await
+    }
+
+    /// Get sleeping tasks that have a non-empty plan_todo.
+    pub async fn list_plan_pending(&self) -> Result<Vec<(String, String)>, VfsError> {
+        TaskDb::list_plan_pending(&self.tasks.pool).await
+    }
+
+    /// Pop the first item from a task's plan_todo.
+    pub async fn pop_plan_head(&self, task_id: &str) -> Result<Option<String>, VfsError> {
+        TaskDb::pop_plan_head(&self.tasks.pool, task_id).await
+    }
+
+    /// Check if a planner has active executor tasks.
+    pub async fn has_active_executor(&self, planner_id: &str) -> Result<bool, VfsError> {
+        let row = sqlx::query(
+            "SELECT COUNT(*) as cnt FROM tasks WHERE plan_parent = ?1 AND status = 'active'"
+        )
+        .bind(planner_id)
+        .fetch_one(&self.tasks.pool)
+        .await
+        .map_err(|e| VfsError::Sqlite(format!("check active executor: {e}")))?;
+        use sqlx::Row;
+        let count: i32 = row.get("cnt");
+        Ok(count > 0)
     }
 
     /// Execute logos_complete. Called by the gRPC layer directly, not through Namespace trait.
@@ -234,6 +260,7 @@ mod tests {
             sleep_reason: String::new(),
             sleep_retry: false,
             resume_task_id: String::new(),
+            plan_todo: vec![],
         };
         let result = sys.complete(params).await.unwrap();
         assert!(!result.anchor_id.is_empty());
@@ -260,6 +287,7 @@ mod tests {
             sleep_reason: String::new(),
             sleep_retry: false,
             resume_task_id: String::new(),
+            plan_todo: vec![],
         };
         sys.complete(params).await.unwrap();
 
@@ -276,5 +304,78 @@ mod tests {
         // pending → finished is not a valid transition
         let result = tasks::TaskDb::transition_status(&sys.tasks.pool, "t-7", "finished").await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn plan_complete_stores_todo_and_sleeps() {
+        let (sys, _dir) = test_system().await;
+        sys.write(&["tasks"], r#"{"task_id":"planner-1","description":"deploy service","chat_id":"c-1"}"#)
+            .await.unwrap();
+        tasks::TaskDb::transition_status(&sys.tasks.pool, "planner-1", "active").await.unwrap();
+
+        // Complete with plan
+        let params = complete::CompleteParams {
+            task_id: "planner-1".to_string(),
+            summary: "planned 3 steps".to_string(),
+            reply: String::new(),
+            anchor: false,
+            anchor_facts: String::new(),
+            task_log: String::new(),
+            sleep_reason: String::new(),
+            sleep_retry: false,
+            resume_task_id: String::new(),
+            plan_todo: vec![
+                "install dependencies".to_string(),
+                "build project".to_string(),
+                "run tests".to_string(),
+            ],
+        };
+        let result = sys.complete(params).await.unwrap();
+        assert_eq!(result.task_id, "planner-1");
+
+        // Task should be sleeping
+        let task_json = sys.get_task("planner-1").await.unwrap().unwrap();
+        let task: serde_json::Value = serde_json::from_str(&task_json).unwrap();
+        assert_eq!(task["status"], "sleep");
+        assert_eq!(task["plan_todo"].as_array().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn plan_pop_head() {
+        let (sys, _dir) = test_system().await;
+        sys.write(&["tasks"], r#"{"task_id":"planner-2","description":"multi-step","chat_id":"c-1"}"#)
+            .await.unwrap();
+        tasks::TaskDb::transition_status(&sys.tasks.pool, "planner-2", "active").await.unwrap();
+
+        let params = complete::CompleteParams {
+            task_id: "planner-2".to_string(),
+            summary: "planned".to_string(),
+            reply: String::new(),
+            anchor: false,
+            anchor_facts: String::new(),
+            task_log: String::new(),
+            sleep_reason: String::new(),
+            sleep_retry: false,
+            resume_task_id: String::new(),
+            plan_todo: vec!["step A".to_string(), "step B".to_string()],
+        };
+        sys.complete(params).await.unwrap();
+
+        // Pop first item
+        let head = sys.pop_plan_head("planner-2").await.unwrap();
+        assert_eq!(head, Some("step A".to_string()));
+
+        // Remaining should be ["step B"]
+        let task_json = sys.get_task("planner-2").await.unwrap().unwrap();
+        let task: serde_json::Value = serde_json::from_str(&task_json).unwrap();
+        assert_eq!(task["plan_todo"].as_array().unwrap().len(), 1);
+
+        // Pop second
+        let head = sys.pop_plan_head("planner-2").await.unwrap();
+        assert_eq!(head, Some("step B".to_string()));
+
+        // Now empty
+        let head = sys.pop_plan_head("planner-2").await.unwrap();
+        assert_eq!(head, None);
     }
 }
