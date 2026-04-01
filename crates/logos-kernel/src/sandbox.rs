@@ -354,20 +354,11 @@ impl ContainerdExecutor {
         let req = with_namespace!(req, CONTAINERD_NS);
 
         // Check if image exists and is already unpacked
-        if let Ok(resp) = images.get(req).await {
-            let image = resp.into_inner().image.unwrap_or_default();
-            // Check if snapshot exists for this image (means it's unpacked)
-            let mut snapshots = ctrd::services::v1::snapshots::snapshots_client::SnapshotsClient::new(self.channel.clone());
-            let identity = self.get_image_identity(&image).await;
-            if let Some(ref id) = identity {
-                let req = ctrd::services::v1::snapshots::StatSnapshotRequest {
-                    snapshotter: "overlayfs".to_string(),
-                    key: id.clone(),
-                };
-                let req = with_namespace!(req, CONTAINERD_NS);
-                if snapshots.stat(req).await.is_ok() {
-                    return Ok(()); // already pulled and unpacked
-                }
+        if images.get(req).await.is_ok() {
+            // Image record exists — check if a valid snapshot parent can be found
+            // (this means the image layers have been unpacked into the snapshotter)
+            if self.find_image_snapshot_parent().await.is_ok() {
+                return Ok(()); // already pulled and unpacked
             }
         }
 
@@ -403,16 +394,6 @@ impl ContainerdExecutor {
 
         println!("[logos] image {} ready", self.image);
         Ok(())
-    }
-
-    /// Get the identity (chain ID) of an image's top layer for use as snapshot parent.
-    async fn get_image_identity(&self, image: &ctrd::services::v1::Image) -> Option<String> {
-        // The image's target digest is the manifest descriptor
-        let target = image.target.as_ref()?;
-        let digest = &target.digest;
-        // containerd uses the image digest to create an identity snapshot
-        // The convention is: the image name itself is used as the snapshot key after unpack
-        Some(self.image.clone())
     }
 
     /// Find the snapshot parent key for the unpacked image.
