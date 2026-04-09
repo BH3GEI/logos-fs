@@ -1,73 +1,10 @@
-//! Built-in proc tools that bridge kernel modules to the ProcTool trait.
-
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use logos_vfs::VfsError;
+use logos_vfs::{Namespace, VfsError};
 
 use crate::proc::ProcTool;
 use crate::sandbox::SandboxNs;
-
-/// memory.search — FTS full-text search (RFC 003 §3.2)
-pub struct MemorySearchTool {
-    pub mm: Arc<logos_mm::MemoryModule>,
-}
-
-#[async_trait]
-impl ProcTool for MemorySearchTool {
-    fn name(&self) -> &str {
-        "memory.search"
-    }
-    fn schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "name": "memory.search",
-            "description": "Full-text search over chat messages.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "chat_id": { "type": "string", "description": "Group chat ID" },
-                    "query": { "type": "string", "description": "Search query" },
-                    "limit": { "type": "integer", "default": 10 }
-                },
-                "required": ["chat_id", "query"]
-            }
-        })
-    }
-    async fn call(&self, params: &str) -> Result<String, VfsError> {
-        self.mm.handle_call("memory.search", params).await
-    }
-}
-
-/// memory.range_fetch — paginated message range query (RFC 003 §3.2)
-pub struct MemoryRangeFetchTool {
-    pub mm: Arc<logos_mm::MemoryModule>,
-}
-
-#[async_trait]
-impl ProcTool for MemoryRangeFetchTool {
-    fn name(&self) -> &str {
-        "memory.range_fetch"
-    }
-    fn schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "name": "memory.range_fetch",
-            "description": "Fetch messages within msg_id ranges with pagination.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "chat_id": { "type": "string", "description": "Group chat ID" },
-                    "ranges": { "type": "array", "items": { "type": "array", "items": { "type": "integer" } }, "description": "Array of [start, end] msg_id pairs" },
-                    "limit": { "type": "integer", "default": 50 },
-                    "offset": { "type": "integer", "default": 0 }
-                },
-                "required": ["chat_id", "ranges"]
-            }
-        })
-    }
-    async fn call(&self, params: &str) -> Result<String, VfsError> {
-        self.mm.handle_call("memory.range_fetch", params).await
-    }
-}
 
 /// system.search_tasks — multi-level experience retrieval (RFC 003 §6.2)
 pub struct SystemSearchTasksTool {
@@ -134,7 +71,6 @@ impl ProcTool for SystemGetContextTool {
         let chat_id = val["chat_id"].as_str().unwrap_or_default();
         let sender_uid = val["sender_uid"].as_str().unwrap_or_default();
         let msg_id = val["msg_id"].as_i64();
-        use logos_vfs::Namespace;
 
         // 1. Session from clustering module
         let session = if let Some(mid) = msg_id {
@@ -150,8 +86,7 @@ impl ProcTool for SystemGetContextTool {
             .await
             .unwrap_or_else(|_| "null".to_string());
 
-        // 3+4. Sender persona (read through users namespace would need table ref,
-        // so we return instructions for the runtime to inject these)
+        // 3+4. Sender persona paths (injected by runtime)
         let context = serde_json::json!({
             "session": session,
             "recent_summary": serde_json::from_str::<serde_json::Value>(&summary)
@@ -243,7 +178,6 @@ impl ProcTool for SystemCompleteTool {
         // Write task_log to sandbox (RFC 002 §9.1)
         if !result.task_log.is_empty() && !result.task_id.is_empty() {
             let log_path = format!("{}/log", result.task_id);
-            use logos_vfs::Namespace;
             if let Err(e) = self.sandbox.write(&[&log_path], &result.task_log).await {
                 eprintln!("[logos] WARNING: failed to write task_log to sandbox: {e}");
             }

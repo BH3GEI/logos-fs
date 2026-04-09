@@ -161,6 +161,7 @@ async fn simulate_task_lifecycle() {
             sleep_reason: String::new(),
             sleep_retry: false,
             resume_task_id: String::new(),
+            plan_todo: vec![],
         })
         .await
         .unwrap();
@@ -278,6 +279,7 @@ async fn simulate_decision_evolution() {
             sleep_reason: String::new(),
             sleep_retry: false,
             resume_task_id: String::new(),
+            plan_todo: vec![],
         })
         .await
         .unwrap();
@@ -307,6 +309,7 @@ async fn simulate_decision_evolution() {
             sleep_reason: String::new(),
             sleep_retry: false,
             resume_task_id: String::new(),
+            plan_todo: vec![],
         })
         .await
         .unwrap();
@@ -401,6 +404,7 @@ async fn simulate_resume_flow() {
             sleep_reason: String::new(),
             sleep_retry: false,
             resume_task_id: "t-sleeping".to_string(),
+            plan_todo: vec![],
         })
         .await
         .unwrap();

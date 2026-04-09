@@ -102,6 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         system: Arc::clone(&system_arc),
         sandbox: Arc::clone(&sandbox_arc),
     }));
+    proc_ns.register(Arc::new(builtin_tools::WebSearchTool::new()));
 
     // 7. proc-store/ — persistent proc tool declarations
     let proc_store_root = env_path("VFS_PROC_STORE_ROOT", "../../data/state/proc-store");

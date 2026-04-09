@@ -150,7 +150,7 @@ mod tests {
         let reg = TokenRegistry::new();
         reg.register("tok-1".to_string(), "task-001".to_string(), String::new(), AgentRole::User)
             .await;
-        let (key, task_id) = reg.consume("tok-1").await.unwrap();
+        let (key, task_id, _) = reg.consume("tok-1").await.unwrap();
         assert_eq!(task_id, "task-001");
         assert!(key.starts_with("s-"));
     }
@@ -175,7 +175,7 @@ mod tests {
         let reg = TokenRegistry::new();
         reg.register("tok-3".to_string(), "task-003".to_string(), "agent-A".to_string(), AgentRole::Admin)
             .await;
-        let (key, _) = reg.consume("tok-3").await.unwrap();
+        let (key, _, _) = reg.consume("tok-3").await.unwrap();
         let info = reg.resolve_info(&key).await.unwrap();
         assert_eq!(info.task_id, "task-003");
         assert!(info.role.is_admin());
@@ -195,7 +195,7 @@ mod tests {
         let reg = TokenRegistry::new();
         reg.register("tok-5".to_string(), "task-005".to_string(), String::new(), AgentRole::User)
             .await;
-        let (key, _) = reg.consume("tok-5").await.unwrap();
+        let (key, _, _) = reg.consume("tok-5").await.unwrap();
         let info = reg.resolve_info(&key).await.unwrap();
         assert!(!info.role.is_admin());
     }
